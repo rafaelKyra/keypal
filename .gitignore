@@ -1,0 +1,8 @@
+/target
+/.tmp
+*.db
+*.db-wal
+*.db-shm
+*.kdbx
+PROMPT.txt
+PROMPT_CONTINUARE.md

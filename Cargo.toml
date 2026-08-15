@@ -1,0 +1,58 @@
+[package]
+name = "valu"
+version = "0.1.0"
+edition = "2021"
+description = "SOTA privacy-first password vault for Linux (KDBX4-compatible core, rafa.ai-inspired ephemeral key lifecycle)"
+license = "MIT"
+
+# ---------------------------------------------------------------------------
+# VALU — workspace layout
+#
+#   valu/
+#     Cargo.toml                 <- this file
+#     ARCHITECTURE.md            <- threat model + key-lifecycle docs (Phase 1)
+#     src/
+#       main.rs                  <- CLI entrypoint / lifecycle orchestration
+#       lib.rs                   <- public crate root, module wiring
+#       secure_mem.rs            <- Phase 1: zeroization, mlockall, SecureBuffer
+#       key_lifecycle.rs         <- Phase 1: Volatile vs Passphrase master keys
+#       circuit_breaker.rs       <- Phase 1: unlock-attempt state machine
+#       redaction.rs             <- Phase 1: log redaction wrapper
+#       storage/
+#         mod.rs                 <- Phase 2: encrypted DB wrapper (SqlCipher)
+#         secure_erase.rs        <- Phase 2: wipe key, WAL truncate, VACUUM
+#       crypto/
+#         mod.rs                 <- AEAD helpers (AES-256-GCM / ChaCha20-Poly1305)
+#         kdf.rs                 <- Argon2id parameter policy
+#     tests/                     <- integration tests (zeroization, erase)
+# ---------------------------------------------------------------------------
+
+[dependencies]
+libc = "0.2"                          # mlockall, setrlimit, madvise (secure_mem)
+# --- Memory safety & zeroization ------------------------------------------
+zeroize = { version = "1.8", features = ["derive"] }   # Zeroize trait + derive macro
+# --- KDF / AEAD -------------------------------------------------------------
+argon2 = { version = "0.5", features = ["std"] }       # Argon2id (RFC 9106)
+aes-gcm = "0.10"                                       # AES-256-GCM
+chacha20poly1305 = "0.10"                              # ChaCha20-Poly1305
+rand_core = { version = "0.6", features = ["std"] }    # OsRng CSPRNG
+hkdf = "0.12"                                          # key separation (HKDF-SHA256)
+sha2 = "0.10"
+# --- Storage -----------------------------------------------------------------
+rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite, bundled C lib
+# --- Logging / redaction ------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- Error handling ------------------------------------------------------------
+thiserror = "2.0"
+keepass = "0.13"
+zbus = "5"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true          # strip symbols: smaller binary, less debug surface in core dumps
+panic = "abort"       # no unwinding => no long-lived stack frames holding secrets
