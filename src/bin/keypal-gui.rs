@@ -1630,16 +1630,21 @@ impl App {
                     let selected = self.open_entry == Some(row.id);
                     // The whole row is the target. A dedicated Open button asks
                     // the user to aim at 60 pixels when 700 were available.
-                    let resp = ui
-                        .scope(|ui| {
-                            if selected {
-                                ui.painter().rect_filled(
-                                    ui.available_rect_before_wrap()
-                                        .expand2(egui::vec2(6.0, 3.0)),
-                                    egui::Rounding::same(8.0),
-                                    pal().accent.linear_multiply(0.18),
-                                );
-                            }
+                    // A Frame, not a hand-painted rectangle. The first attempt
+                    // painted into `available_rect_before_wrap()`, which is the
+                    // whole remaining panel rather than this row — so selecting
+                    // an entry flooded everything below it with colour. A Frame
+                    // is sized by its own contents, which is the only thing that
+                    // can be correct here.
+                    let resp = egui::Frame::none()
+                        .fill(if selected {
+                            pal().accent.linear_multiply(0.16)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .rounding(egui::Rounding::same(9.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 avatar(ui, &row.name, 30.0);
                                 ui.add_space(4.0);
