@@ -183,6 +183,7 @@ struct App {
     show_help_locked: bool,
     loading_text: bool,
     text_path: String,
+    unlocking_since: Option<Instant>,
     shot_requested: bool,
     shot_countdown: u32,
     draft: Draft,
@@ -232,6 +233,7 @@ impl Default for App {
             show_help_locked: false,
             loading_text: false,
             text_path: String::new(),
+            unlocking_since: None,
             shot_requested: false,
             shot_countdown: 8,
             draft: Draft::default(),
@@ -521,6 +523,7 @@ impl App {
     }
 
     fn unlock(&mut self) {
+        self.unlocking_since = Some(Instant::now());
         let Some(path) = self.target_path() else {
             return self.set("Choose a vault first", Level::Bad);
         };
@@ -989,6 +992,52 @@ fn logo(ui: &mut egui::Ui, size: f32) {
     ));
 }
 
+/// A quiet column of drifting hex glyphs down one edge.
+///
+/// SECURITY NOTE, because this is the obvious place to get it wrong: the
+/// glyphs are RANDOM, never real ciphertext from the vault. Drawing actual
+/// encrypted bytes would put fragments of the user's file on screen for anyone
+/// looking over a shoulder or taking a screenshot. Ciphertext is not secret,
+/// but it is not decoration either, and a vault should not display its own
+/// contents for atmosphere.
+///
+/// Everything here is arithmetic on positions and opacity — no assets, no
+/// decoding, nothing read from disk.
+fn cipher_rain(ui: &mut egui::Ui, rect: egui::Rect, t: f64, intensity: f32) {
+    const COLS: usize = 7;
+    const GLYPHS: &[u8] = b"0123456789ABCDEF";
+    let p = ui.painter().with_clip_rect(rect);
+    let c = pal();
+
+    for col in 0..COLS {
+        let x = rect.left() + (col as f32 + 0.5) * (rect.width() / COLS as f32);
+        // Each column drifts at its own speed and offset, so they never march
+        // in step — a lockstep grid reads as a progress bar, not as noise.
+        let speed = 26.0 + (col as f64 * 13.0) % 40.0;
+        let phase = (col as f64 * 97.0) % 400.0;
+        let head = ((t * speed + phase) % (rect.height() as f64 + 220.0)) as f32 - 110.0;
+
+        for k in 0..11 {
+            let y = rect.top() + head - k as f32 * 17.0;
+            if y < rect.top() - 20.0 || y > rect.bottom() + 20.0 {
+                continue;
+            }
+            // Deterministic from position and a slow time step, so a glyph
+            // holds for a moment instead of flickering every frame.
+            let seed = (col * 31 + k * 17) as f64 + (t * 3.0).floor();
+            let g = GLYPHS[(seed.abs() as usize * 2654435761) % GLYPHS.len()] as char;
+            let fade = (1.0 - k as f32 / 11.0).powf(1.6);
+            p.text(
+                egui::pos2(x, y),
+                egui::Align2::CENTER_CENTER,
+                g,
+                egui::FontId::monospace(13.0),
+                c.accent.gamma_multiply(fade * intensity),
+            );
+        }
+    }
+}
+
 /// Icons drawn as shapes, not loaded as images.
 ///
 /// Deliberate: an image file needs a decoder running over data at startup, and
@@ -1262,8 +1311,15 @@ fn meter(ui: &mut egui::Ui, password: &str) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // A TOTP code counts down, so repaint even when nothing is clicked.
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // A TOTP code counts down and the lock screen animates, so repaint on a
+        // timer rather than only on input. Slower when locked: nothing there
+        // needs sixty frames a second, and a vault should not spin a laptop fan
+        // while it sits waiting for a passphrase.
+        ctx.request_repaint_after(Duration::from_millis(if self.db.is_some() {
+            500
+        } else {
+            50
+        }));
 
         if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity() != egui::Vec2::ZERO) {
             self.last_input = Instant::now();
@@ -1689,6 +1745,21 @@ impl App {
     }
 
     fn locked(&mut self, ui: &mut egui::Ui) {
+        // Down the left edge only, at low opacity: present enough to suggest
+        // the machinery, quiet enough that the passphrase field stays the
+        // subject of the screen.
+        let full = ui.max_rect();
+        let strip = egui::Rect::from_min_size(
+            full.min,
+            egui::vec2((full.width() * 0.13).min(120.0), full.height()),
+        );
+        let t = ui.input(|i| i.time);
+        // The surge is honest: it runs while Argon2 is actually working, which
+        // takes real time, so the animation reports the wait rather than
+        // decorating an instant.
+        let busy = self.unlocking_since.map(|s| s.elapsed().as_secs_f32() < 2.0).unwrap_or(false);
+        cipher_rain(ui, strip, t, if busy { 0.55 } else { 0.16 });
+
         // The first screen anyone sees. It was a grey form on a grey field;
         // now it carries the mark and one line saying what this is, because a
         // lock screen with no identity reads as an error dialog.
