@@ -199,6 +199,9 @@ struct App {
     manual_path: String,
     passphrase: String,
     creating: bool,
+    /// The in-app file browser on the lock screen, and where it is pointed.
+    file_browser: bool,
+    browse_dir: PathBuf,
     new_path: String,
     new_pass: String,
     new_pass_again: String,
@@ -258,6 +261,8 @@ impl Default for App {
             manual_path: String::new(),
             passphrase: String::new(),
             creating: false,
+            file_browser: false,
+            browse_dir: home(),
             new_path: free_vault_path(),
             new_pass: String::new(),
             new_pass_again: String::new(),
@@ -973,6 +978,31 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
 /// A 400px field spread over 1800px of window is not more usable for being
 /// bigger — the eye loses the line, and the empty space reads as a broken
 /// layout. Every modal panel goes through this so they all share one measure.
+/// A reading page: much wider than a form, because it holds prose.
+///
+/// A form is a column of fields and 560px is right for it. Running several
+/// screens of explanation through the same measure put a wall of text in a
+/// small box in the middle of an empty window — the reader gets a keyhole view
+/// of a document and has to scroll four times as far to read it.
+fn page<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // Capped all the same. Prose set across 1600px of window is a line the eye
+    // loses its place on returning; somewhere near ninety characters is where
+    // reading stops being work.
+    const MEASURE: f32 = 900.0;
+    let avail = ui.available_rect_before_wrap();
+    let width = avail.width().min(MEASURE);
+    let pad = ((avail.width() - width) / 2.0).max(0.0);
+    // An explicit rectangle, NOT a horizontal layout with a spacer. A
+    // horizontal sizes itself to its contents' height, so a scroll area placed
+    // inside one is handed almost no height and clips its text to two lines —
+    // which is exactly how this page came to show its title and nothing else.
+    let rect = egui::Rect::from_min_size(
+        avail.min + egui::vec2(pad, 0.0),
+        egui::vec2(width, avail.height()),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| add(ui)).inner
+}
+
 fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     const MEASURE: f32 = 560.0;
     let width = ui.available_width().min(MEASURE);
@@ -1017,10 +1047,60 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 ///
 /// One saturated shape in an otherwise quiet interface. Without it the header
 /// is two lines of grey text and the window has no focal point at all.
+/// The mascot, as the launcher shows it.
+///
+/// Embedded at COMPILE time, not read from disk. The rest of the interface is
+/// drawn rather than loaded, and the reason given for that still stands: an
+/// icon file sitting beside the binary is one an attacker can swap, and a
+/// decoder pointed at it is parsing surface a vault did not need. Neither
+/// applies to bytes baked into the executable — they cannot be replaced
+/// without replacing the program, and the PNG is fixed and known, decoded once
+/// at startup by a crate already linked in for screenshots.
+///
+/// What it buys: the mark on screen is the same painting as the icon in the
+/// menu, pixel for pixel, instead of a redrawing of it that drifts.
+const MASCOT_PNG: &[u8] = include_bytes!("../../assets/mascot.png");
+
+thread_local! {
+    static MASCOT: std::cell::RefCell<Option<Option<egui::TextureHandle>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Decode and upload the mascot once. `None` means it could not be decoded, in
+/// which case the caller draws the mark by hand instead — a missing picture
+/// must not be a missing logo.
+fn mascot_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    MASCOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((|| {
+                let decoder = png::Decoder::new(MASCOT_PNG);
+                let mut reader = decoder.read_info().ok()?;
+                let mut buf = vec![0; reader.output_buffer_size()];
+                let info = reader.next_frame(&mut buf).ok()?;
+                if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight
+                {
+                    return None;
+                }
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [info.width as usize, info.height as usize],
+                    &buf[..info.buffer_size()],
+                );
+                Some(ctx.load_texture("mascot", image, egui::TextureOptions::LINEAR))
+            })());
+        }
+        slot.as_ref().and_then(|t| t.clone())
+    })
+}
+
 fn logo(ui: &mut egui::Ui, size: f32) {
-    // The launcher icon's silhouette, drawn: a shield behind a key with a face.
-    // A letter tile said nothing; this is the same mark the system shows in the
-    // menu, so the application and its icon are recognisably one thing.
+    if let Some(tex) = mascot_texture(ui.ctx()) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        egui::Image::new(&tex).paint_at(ui, rect);
+        return;
+    }
+    // Fallback: the same silhouette drawn by hand, for the case where the
+    // embedded picture cannot be decoded.
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let p = ui.painter();
     let c = pal();
@@ -1808,6 +1888,12 @@ impl eframe::App for App {
             // Optionally open a vault first, so the screens behind the lock can
             // be photographed too. Only ever reached with KEYPAL_SHOT set.
             if self.shot_countdown == 8 {
+                // Outside the unlock block: the browser lives on the LOCK
+                // screen, which is what you get when no vault is given.
+                if std::env::var("KEYPAL_SHOT_BROWSE").is_ok() {
+                    self.file_browser = true;
+                    self.browse_dir = home();
+                }
                 if let (Ok(v), Ok(pw)) =
                     (std::env::var("KEYPAL_SHOT_VAULT"), std::env::var("KEYPAL_SHOT_PASS"))
                 {
@@ -1990,7 +2076,7 @@ impl eframe::App for App {
                 .and_then(|id| self.rows.iter().find(|r| r.id == id).cloned());
             egui::SidePanel::right("details")
                 .resizable(true)
-                .default_width(310.0)
+                .default_width(376.0)
                 .frame(
                     egui::Frame::none()
                         .fill(pal().bg)
@@ -2318,7 +2404,10 @@ impl App {
                         .color(pal().text),
                 );
                 ui.label(
-                    egui::RichText::new("security vault  ·  by R.K.")
+                    egui::RichText::new(format!(
+                        "security vault  ·  v{}  ·  by Rafael Kyra",
+                        env!("CARGO_PKG_VERSION")
+                    ))
                         .size(10.5)
                         .color(pal().muted),
                 );
@@ -2367,11 +2456,29 @@ impl App {
                     .size(12.5)
                     .color(pal().muted),
             );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "version {}  ·  by Rafael Kyra",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .size(11.0)
+                .color(pal().muted),
+            );
         });
         ui.add_space(18.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
         form(ui, |ui| {
             label(ui, "YOUR VAULTS");
+            ui.add_space(4.0);
+            // Where they were found, said out loud. "Your vaults" with no
+            // folder beside it leaves the user unable to answer the one
+            // question that matters for a backup: where is my file?
+            ui.label(
+                egui::RichText::new(format!("found in {}", home().display()))
+                    .size(11.0)
+                    .color(pal().muted),
+            );
             ui.add_space(4.0);
             if self.vaults.is_empty() {
                 ui.label(egui::RichText::new("None found in your home folder.").color(pal().muted));
@@ -2384,14 +2491,20 @@ impl App {
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
                         let chosen = self.selected.as_ref() == Some(&path);
+                        let size = std::fs::metadata(&path)
+                            .map(|m| format!("{} KB", m.len() / 1024))
+                            .unwrap_or_default();
                         let t = if chosen {
-                            egui::RichText::new(format!("  {name}")).color(pal().accent).strong()
+                            egui::RichText::new(format!("  {name}   {size}"))
+                                .color(pal().accent)
+                                .strong()
                         } else {
-                            egui::RichText::new(format!("  {name}")).color(pal().text)
+                            egui::RichText::new(format!("  {name}   {size}")).color(pal().text)
                         };
                         if ui.selectable_label(chosen, t).clicked() {
                             self.selected = Some(path.clone());
                             self.manual_path.clear();
+                            self.file_browser = false;
                         }
                     }
                 });
@@ -2399,7 +2512,24 @@ impl App {
 
             ui.add_space(10.0);
             label(ui, "OR A PATH");
-            field(ui, &mut self.manual_path, "/home/you/vault.db", false);
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 96.0).max(120.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.manual_path)
+                        .hint_text("/home/you/vault.db")
+                        .desired_width(w)
+                        .margin(egui::Margin::symmetric(10.0, 7.0)),
+                );
+                if ui.button(if self.file_browser { "Close" } else { "Browse…" }).clicked() {
+                    self.file_browser = !self.file_browser;
+                    if self.file_browser && self.browse_dir.as_os_str().is_empty() {
+                        self.browse_dir = home();
+                    }
+                }
+            });
+            if self.file_browser {
+                self.browse_view(ui);
+            }
 
             ui.add_space(10.0);
             label(ui, "PASSPHRASE");
@@ -2450,6 +2580,127 @@ impl App {
             });
         });
         });
+    }
+
+    /// A file browser, built rather than borrowed.
+    ///
+    /// There is still no native dialog: `rfd` wants Wayland development
+    /// packages this machine does not have, and needing a system package
+    /// installed before you can open your own vault is a worse answer than not
+    /// needing one. This reads directory names and nothing else — it never
+    /// opens a file, so browsing to a folder full of strangers' data parses
+    /// none of it.
+    ///
+    /// Only directories and `.db` files are listed. Showing every file would
+    /// bury the two or three that can actually be opened.
+    fn browse_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        egui::Frame::none()
+            .fill(pal().surface_hi)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Plain words, no arrow glyph: the embedded monospace
+                    // font has no U+2191 and drew it as an empty box.
+                    if ui.small_button("Up").clicked() {
+                        if let Some(parent) = self.browse_dir.parent() {
+                            self.browse_dir = parent.to_path_buf();
+                        }
+                    }
+                    if ui.small_button("Home").clicked() {
+                        self.browse_dir = home();
+                    }
+                    ui.label(
+                        egui::RichText::new(self.browse_dir.display().to_string())
+                            .size(11.0)
+                            .color(pal().muted),
+                    );
+                });
+                ui.add_space(4.0);
+
+                // Read once per frame. A directory that cannot be read says so
+                // rather than showing an empty list, which would look like an
+                // empty folder and send the user hunting in the wrong place.
+                let mut dirs: Vec<PathBuf> = Vec::new();
+                let mut files: Vec<PathBuf> = Vec::new();
+                match std::fs::read_dir(&self.browse_dir) {
+                    Ok(entries) => {
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            let hidden = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().starts_with('.'))
+                                .unwrap_or(false);
+                            if hidden {
+                                continue;
+                            }
+                            if p.is_dir() {
+                                dirs.push(p);
+                            } else if p.extension().is_some_and(|x| x == "db") {
+                                files.push(p);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("cannot read this folder — {e}"))
+                                .size(11.5)
+                                .color(pal().danger),
+                        );
+                    }
+                }
+                dirs.sort();
+                files.sort();
+
+                if dirs.is_empty() && files.is_empty() {
+                    ui.label(
+                        egui::RichText::new("nothing here to open")
+                            .size(11.5)
+                            .color(pal().muted),
+                    );
+                }
+
+                egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                    for d in dirs {
+                        let name = d.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if nav_row(ui, None, &format!("  {name}/"), None, false,
+                                   pal().accent, 4.0, false).clicked()
+                        {
+                            self.browse_dir = d.clone();
+                        }
+                    }
+                    for f in files {
+                        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let vault = looks_like_vault(&f);
+                        let kb = std::fs::metadata(&f).map(|m| (m.len() / 1024) as usize).unwrap_or(0);
+                        // A .db that is not a Keypal vault is still listed, but
+                        // greyed: hiding it would leave the user staring at a
+                        // folder they know contains the file.
+                        let resp = nav_row(
+                            ui,
+                            Some(if vault { Icon::Lock } else { Icon::Sheet }),
+                            &name,
+                            Some(kb),
+                            self.manual_path == f.display().to_string(),
+                            if vault { pal().accent } else { pal().muted },
+                            4.0,
+                            vault,
+                        );
+                        if resp.clicked() {
+                            self.manual_path = f.display().to_string();
+                            self.selected = None;
+                            self.file_browser = false;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("sizes in KB · only folders and .db files are shown")
+                        .size(10.5)
+                        .color(pal().muted),
+                );
+            });
     }
 
     fn create_view(&mut self, ui: &mut egui::Ui) {
@@ -2757,20 +3008,39 @@ impl App {
                     });
                 });
             });
-            ui.add_space(8.0);
-            // Reading order, not reverse: Edit is the common action and comes
-            // first; Close last, where a dismiss belongs.
+            ui.add_space(10.0);
+
+            // The thing people came for, as one big button: nine times out of
+            // ten opening an entry means copying its secret, and that was a
+            // 60-pixel "Copy" three rows down among five identical ones.
+            if let Some(what) = row.kind.secret_label() {
+                if !row.password.is_empty() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(
+                                [ui.available_width().min(230.0), 34.0],
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Copy {}", what.to_lowercase()))
+                                        .size(13.5)
+                                        .strong()
+                                        .color(pal().on_accent),
+                                )
+                                .fill(pal().accent),
+                            )
+                            .clicked()
+                        {
+                            copy_now = Some(row.password.clone());
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+
+            // Edit is the common action and leads. Delete used to sit second,
+            // one slot from the button people reach for without looking —
+            // it is now behind a menu, which is where an irreversible thing
+            // belongs.
             ui.horizontal_wrapped(|ui| {
-                    if icon_button(ui, Icon::Close, "Close") {
-                        self.open_entry = None;
-                    }
-                    if icon_button(ui, Icon::Trash, "Delete") {
-                        self.panel = Panel::Confirm(row.id, row.name.clone());
-                    }
-                    if icon_button(ui, Icon::Clock, "History") {
-                        self.load_history(row.id);
-                        self.panel = Panel::History(row.id);
-                    }
                     if icon_button(ui, Icon::Edit, "Edit") {
                         self.draft = Draft {
                             id: Some(row.id),
@@ -2788,8 +3058,21 @@ impl App {
                         };
                         self.panel = Panel::Editor;
                     }
+                    if icon_button(ui, Icon::Clock, "History") {
+                        self.load_history(row.id);
+                        self.panel = Panel::History(row.id);
+                    }
+                    ui.menu_button("More  v", |ui| {
+                        if ui.button("Move to trash…").clicked() {
+                            self.panel = Panel::Confirm(row.id, row.name.clone());
+                            ui.close_menu();
+                        }
+                    });
+                    if icon_button(ui, Icon::Close, "Close") {
+                        self.open_entry = None;
+                    }
             });
-            ui.add_space(8.0);
+            ui.add_space(10.0);
 
             if !row.username.is_empty() {
                 label(ui, &row.kind.username_label().unwrap_or("USERNAME").to_uppercase());
@@ -3697,19 +3980,65 @@ impl App {
         // marketing. Every claim here is one the tests enforce; the limits
         // section exists because a security page that lists only strengths is
         // an advertisement.
-        form(ui, |ui| {
-            egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+        // Back FIRST, at the top left, before the reader has scrolled anywhere.
+        // The only way out used to be a Close button at the foot of six screens
+        // of prose — so anyone who opened this page by accident had to read it
+        // all, or guess, to get out.
+        let locked = self.show_help_locked;
+        page(ui, |ui| {
+            ui.horizontal(|ui| {
+                if icon_button(ui, Icon::Close, if locked { "Back to start" } else { "Back to vault" })
+                {
+                    self.panel = Panel::List;
+                    self.show_help_locked = false;
+                }
+            });
+            ui.add_space(6.0);
+            // KEYPAL_SHOT_SCROLL=<pixels> starts this page part-way down, so
+            // the sections below the fold can be photographed. Ignored unless
+            // a screenshot is being taken.
+            let mut area = egui::ScrollArea::vertical();
+            if let Some(y) = std::env::var("KEYPAL_SHOT_SCROLL")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+            {
+                area = area.vertical_scroll_offset(y);
+            }
+            area.show(ui, |ui| {
                 let h = |ui: &mut egui::Ui, t: &str| {
-                    ui.add_space(12.0);
-                    ui.label(egui::RichText::new(t).size(14.0).strong().color(pal().accent));
-                    ui.add_space(4.0);
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new(t).size(15.0).strong().color(pal().accent));
+                    ui.add_space(5.0);
                 };
                 let para = |ui: &mut egui::Ui, t: &str| {
-                    ui.label(egui::RichText::new(t).size(13.0).color(pal().text));
-                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(t).size(13.5).color(pal().text));
+                    ui.add_space(7.0);
+                };
+                // Paths are shown in monospace: a path is something you copy
+                // and type, not something you read as a sentence.
+                let path_line = |ui: &mut egui::Ui, what: &str, p: String| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(what).size(12.5).color(pal().muted));
+                        ui.label(egui::RichText::new(p).size(12.5).monospace().color(pal().text));
+                    });
+                    ui.add_space(3.0);
                 };
 
-                ui.label(egui::RichText::new("How this protects you").size(19.0).strong());
+                ui.horizontal(|ui| {
+                    logo(ui, 40.0);
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("How this protects you").size(21.0).strong());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Keypal {}  ·  by Rafael Kyra",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(11.5)
+                            .color(pal().muted),
+                        );
+                    });
+                });
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("Written to be checked, not believed.")
@@ -3798,6 +4127,44 @@ impl App {
                           it carries its own key — a lock with the key taped to it — \
                           while blocking the independent review that would find real \
                           flaws. AES is public for the same reason.");
+
+                h(ui, "Where everything is on this machine");
+                para(ui, "Nothing is hidden and nothing is in a database you cannot \
+                          copy. Your vault is one ordinary file — back it up by copying \
+                          it, move it by moving it. These are the real paths on this \
+                          machine, read from the running program rather than written \
+                          into this page:");
+                path_line(
+                    ui,
+                    "The program ",
+                    std::env::current_exe()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "unknown".into()),
+                );
+                path_line(
+                    ui,
+                    "Vaults are looked for in ",
+                    home().display().to_string(),
+                );
+                path_line(
+                    ui,
+                    "Open vault ",
+                    self.vault_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none — the vault is locked".into()),
+                );
+                if let Some(root) = portable_root() {
+                    path_line(ui, "Portable mode, so everything stays in ", root.display().to_string());
+                }
+                para(ui, "Beside the vault file SQLite keeps two companions while it is \
+                          open, ending in -wal and -shm. Copy them along with the vault \
+                          if you back it up while the program is running; on a clean \
+                          close there is nothing in them.");
+                para(ui, "The program writes nothing else: no configuration in your home \
+                          folder, no cache, no logs, no temporary copies. Temporary \
+                          tables are held in memory precisely so no fragment of a \
+                          decrypted entry is written to /tmp.");
 
                 h(ui, "Carrying it on a USB stick");
                 para(ui, "Put an empty file named .keypal-portable beside the program and \

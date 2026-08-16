@@ -1,6 +1,6 @@
 [package]
 name = "valu"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "SOTA privacy-first password vault for Linux (KDBX4-compatible core, rafa.ai-inspired ephemeral key lifecycle)"
 license = "MIT"
