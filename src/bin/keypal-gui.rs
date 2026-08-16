@@ -217,6 +217,8 @@ struct App {
     revealed_fields: std::collections::HashSet<String>,
     /// Filter the list to one category, from the sidebar.
     kind_filter: Option<Kind>,
+    /// Families the user has folded shut in the navigation pane.
+    collapsed_groups: std::collections::HashSet<kind::Group>,
     focus_search: bool,
     show_help_locked: bool,
     loading_text: bool,
@@ -269,6 +271,7 @@ impl Default for App {
             reveal_notes: false,
             revealed_fields: Default::default(),
             kind_filter: None,
+            collapsed_groups: Default::default(),
             focus_search: false,
             show_help_locked: false,
             loading_text: false,
@@ -1224,10 +1227,19 @@ fn kind_color(k: Kind) -> egui::Color32 {
     ))
 }
 
-/// Draw `icon` into a square of `size`, in `color`.
+/// Draw `icon` into a square of `size`, in `color`, taking layout space.
 fn icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let p = ui.painter();
+    draw_icon(ui.painter(), rect, icon, color);
+}
+
+/// Draw `icon` into `rect` without taking layout space.
+///
+/// Split out from `icon` so a row that paints its own background and aligns its
+/// own columns — the navigation pane — can place the glyph exactly, instead of
+/// nesting layouts that each re-measure and drift apart by a pixel.
+fn draw_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
+    let size = rect.width().min(rect.height());
     let c = rect.center();
     let u = size / 24.0; // the shapes below are described on a 24-unit grid
     let w = 1.7 * u;
@@ -1598,6 +1610,106 @@ fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
     );
 }
 
+/// One row of the navigation pane.
+///
+/// Every row in the left pane goes through here: the totals, the group
+/// headings, the categories, the tags. That is the point — a pane where each
+/// kind of row was laid out by its own code drifted into four different
+/// indents and three different ways of showing a number, which reads as
+/// carelessness even when nobody can say why.
+///
+/// Counts are right-aligned against the pane edge. Trailing them after the
+/// label ("Website   2") puts every number at a different x, so the column
+/// cannot be read down; aligned, it can be, and comparing two categories stops
+/// being work.
+#[allow(clippy::too_many_arguments)]
+fn nav_row(
+    ui: &mut egui::Ui,
+    glyph: Option<Icon>,
+    text: &str,
+    count: Option<usize>,
+    selected: bool,
+    tint: egui::Color32,
+    indent: f32,
+    strong: bool,
+) -> egui::Response {
+    const H: f32 = 27.0;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::click());
+    let p = ui.painter();
+
+    if selected {
+        p.rect_filled(rect, egui::Rounding::same(7.0), tint.linear_multiply(0.20));
+    } else if resp.hovered() {
+        p.rect_filled(rect, egui::Rounding::same(7.0), pal().surface_hi);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let text_color = if selected { tint } else if strong { pal().text } else { pal().muted };
+    let mut x = rect.left() + indent;
+    if let Some(g) = glyph {
+        const S: f32 = 14.0;
+        let r = egui::Rect::from_center_size(
+            egui::pos2(x + S / 2.0, rect.center().y),
+            egui::vec2(S, S),
+        );
+        draw_icon(p, r, g, if selected { tint } else { tint.gamma_multiply(0.92) });
+        x += S + 8.0;
+    }
+
+    // The count is drawn first so its width is known, then the label is
+    // clipped to what is left. A long category name must never run underneath
+    // its own number.
+    let mut right = rect.right() - 4.0;
+    if let Some(n) = count {
+        let galley = p.layout_no_wrap(
+            n.to_string(),
+            egui::FontId::proportional(11.5),
+            if selected { tint } else { pal().muted },
+        );
+        let at = egui::pos2(right - galley.size().x, rect.center().y - galley.size().y / 2.0);
+        p.galley(at, galley.clone(), pal().text);
+        right -= galley.size().x + 10.0;
+    }
+
+    let avail = (right - x).max(10.0);
+    let galley = p.layout(
+        text.to_string(),
+        egui::FontId::proportional(if strong { 12.5 } else { 12.5 }),
+        text_color,
+        avail,
+    );
+    p.galley(
+        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+
+    resp
+}
+
+/// A small triangle that says whether a group is open.
+fn disclosure(p: &egui::Painter, rect: egui::Rect, open: bool, color: egui::Color32) {
+    let c = rect.center();
+    let s = 3.6;
+    let pts = if open {
+        vec![
+            egui::pos2(c.x - s, c.y - s * 0.6),
+            egui::pos2(c.x + s, c.y - s * 0.6),
+            egui::pos2(c.x, c.y + s * 0.8),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - s * 0.6, c.y - s),
+            egui::pos2(c.x - s * 0.6, c.y + s),
+            egui::pos2(c.x + s * 0.8, c.y),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
 fn label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(12.0).color(pal().muted));
 }
@@ -1731,6 +1843,16 @@ impl eframe::App for App {
                             .map(Kind::from_i64);
                         if let Some(k) = want {
                             self.draft.kind = k;
+                            // On the list, the same variable narrows the
+                            // navigation pane's category filter, so the
+                            // filtered state can be photographed too.
+                            if panel == "list" {
+                                self.kind_filter = Some(k);
+                            }
+                        }
+                        // KEYPAL_SHOT_SEARCH=<text> types into the search box.
+                        if let Ok(q) = std::env::var("KEYPAL_SHOT_SEARCH") {
+                            self.filter = q;
                         }
                         if panel == "detail" {
                             let row = self.rows.iter().find(|r| want.is_none_or(|k| r.kind == k));
@@ -1852,7 +1974,7 @@ impl eframe::App for App {
         if browsing {
             egui::SidePanel::left("nav")
                 .resizable(true)
-                .default_width(190.0)
+                .default_width(236.0)
                 .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
                 .show(ctx, |ui| self.sidebar(ui));
 
@@ -1879,6 +2001,23 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical().show(ui, |ui| self.detail(ui, &row));
                     }
                     None => {
+                        // The cipher rain, kept alive inside the unlocked
+                        // window — but only here, in the one pane that is
+                        // genuinely empty. Behind the list or the editor it
+                        // would be moving texture under text somebody is
+                        // reading, which is decoration bought with legibility.
+                        //
+                        // A third of the lock screen's intensity: at the lock
+                        // screen it is the subject, here it is the wallpaper,
+                        // and something you sit in front of all day must be
+                        // quiet enough to ignore.
+                        let t = ui.input(|i| i.time);
+                        let rect = ui.available_rect_before_wrap();
+                        cipher_rain(ui, rect, t, 0.16);
+                        // Repaint only while this pane is showing, so an idle
+                        // window with an entry open is not animating anything.
+                        ui.ctx().request_repaint_after(Duration::from_millis(60));
+
                         ui.add_space(ui.available_height() * 0.30);
                         ui.vertical_centered(|ui| {
                             logo(ui, 46.0);
@@ -1984,140 +2123,186 @@ impl App {
     }
 
     /// Left pane: tag filters with counts, and the health summary.
+    /// The navigation pane: search, then the vault organised by family.
+    ///
+    /// Everything here works on `self.rows`, which is already decrypted and in
+    /// memory. The counts, the groups and the search are arithmetic over that —
+    /// nothing new is written down, no index of names is built, and nothing
+    /// touches the file. A sidebar that had to be fast by keeping a plaintext
+    /// index beside the ciphertext would be a sidebar that undoes the vault.
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        label(ui, "VAULT");
-        ui.add_space(4.0);
-
         let total = self.rows.len();
-        let all_selected = self.tag_filter.is_none() && self.kind_filter.is_none();
-        if ui
-            .selectable_label(
-                all_selected,
-                egui::RichText::new(format!("  All entries   {total}"))
-                    .color(if all_selected { pal().accent } else { pal().text }),
-            )
-            .clicked()
-        {
-            self.tag_filter = None;
-            self.kind_filter = None;
+
+        // ── Search, at the top of the pane ────────────────────────────────
+        // It lives here rather than in the toolbar because searching and
+        // narrowing by category are the same act — finding the thing — and
+        // splitting them across two panes made the user look in two places.
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut self.filter)
+                .hint_text("Search…   ( / )")
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(10.0, 7.0)),
+        );
+        if self.focus_search {
+            search.request_focus();
+            self.focus_search = false;
+        }
+        if !self.filter.is_empty() {
+            // How much the search is hiding, said plainly. Otherwise a stale
+            // filter looks like a half-empty vault.
+            let shown = self.matching_rows().len();
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{shown} of {total}"))
+                        .size(11.0)
+                        .color(pal().muted),
+                );
+                if ui.small_button("clear").clicked() {
+                    self.filter.clear();
+                }
+            });
         }
 
-        let favs = self.rows.iter().filter(|r| r.favorite).count();
-        if favs > 0 {
-            let on = self.tag_filter.as_deref() == Some("\u{2605}");
-            if ui
-                .selectable_label(
-                    on,
-                    egui::RichText::new(format!("  Favourites   {favs}"))
-                        .color(if on { pal().accent } else { pal().text }),
-                )
-                .clicked()
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── Totals ───────────────────────────────────────────────────
+            let all_selected = self.tag_filter.is_none() && self.kind_filter.is_none();
+            if nav_row(ui, Some(Icon::Stack), "All entries", Some(total), all_selected,
+                       pal().accent, 2.0, true).clicked()
             {
-                self.tag_filter = if on { None } else { Some("\u{2605}".into()) };
+                self.tag_filter = None;
+                self.kind_filter = None;
             }
-        }
 
-        // Categories, with counts. Only the ones the vault actually contains:
-        // sixteen headings above a vault holding three of them is a filing
-        // cabinet with thirteen empty drawers, and it pushes the tags and the
-        // health score off the bottom of the pane.
-        let mut kind_counts: std::collections::BTreeMap<Kind, usize> = Default::default();
-        for r in &self.rows {
-            *kind_counts.entry(r.kind).or_insert(0) += 1;
-        }
-        if kind_counts.len() > 1 {
+            let favs = self.rows.iter().filter(|r| r.favorite).count();
+            if favs > 0 {
+                let on = self.tag_filter.as_deref() == Some("\u{2605}");
+                if nav_row(ui, Some(Icon::Shield), "Favourites", Some(favs), on,
+                           pal().accent, 2.0, true).clicked()
+                {
+                    self.tag_filter = if on { None } else { Some("\u{2605}".into()) };
+                }
+            }
+
+            // ── Categories, by family ────────────────────────────────────
+            let mut per_kind: std::collections::HashMap<Kind, usize> = Default::default();
+            for r in &self.rows {
+                *per_kind.entry(r.kind).or_insert(0) += 1;
+            }
+
             ui.add_space(12.0);
             label(ui, "CATEGORIES");
-            ui.add_space(4.0);
-            for (k, n) in kind_counts {
-                let on = self.kind_filter == Some(k);
-                let tint = kind_color(k);
-                let resp = ui
-                    .horizontal(|ui| {
-                        ui.add_space(2.0);
-                        icon(ui, kind_icon(k), 13.0, tint);
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!("{}   {n}", k.label()))
-                                .size(12.5)
-                                .color(if on { tint } else { pal().text }),
-                        );
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if resp.clicked() {
-                    // Clicking the active one clears it, so the filter can be
-                    // undone where it was set rather than only from "All".
-                    self.kind_filter = if on { None } else { Some(k) };
-                }
-            }
-        }
+            ui.add_space(3.0);
 
-        // Tags, with how many entries carry each. A tag list without counts
-        // makes you click every one to find out where anything is.
-        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-        for r in &self.rows {
-            for t in r.tags.as_deref().unwrap_or("").split(',') {
-                let t = t.trim();
-                if !t.is_empty() {
-                    *counts.entry(t.to_string()).or_insert(0) += 1;
+            for g in kind::GROUPS {
+                let subtotal: usize = g.kinds().iter().filter_map(|k| per_kind.get(k)).sum();
+                // A family with nothing in it is a drawer with no contents.
+                // Showing all four regardless would push the tags and the
+                // health score off the bottom of a pane that is mostly empty.
+                if subtotal == 0 {
+                    continue;
+                }
+                let open = !self.collapsed_groups.contains(&g);
+
+                let resp = nav_row(ui, None, g.label(), Some(subtotal), false,
+                                   pal().accent, 16.0, true);
+                // The triangle is painted after the row so it sits on top of
+                // the hover fill rather than under it.
+                disclosure(
+                    ui.painter(),
+                    egui::Rect::from_center_size(
+                        egui::pos2(resp.rect.left() + 7.0, resp.rect.center().y),
+                        egui::vec2(12.0, 12.0),
+                    ),
+                    open,
+                    pal().muted,
+                );
+                if resp.clicked() {
+                    if open {
+                        self.collapsed_groups.insert(g);
+                    } else {
+                        self.collapsed_groups.remove(&g);
+                    }
+                }
+                if !open {
+                    continue;
+                }
+
+                for k in g.kinds() {
+                    let Some(n) = per_kind.get(k).copied() else { continue };
+                    let on = self.kind_filter == Some(*k);
+                    if nav_row(ui, Some(kind_icon(*k)), k.label(), Some(n), on,
+                               kind_color(*k), 16.0, true).clicked()
+                    {
+                        // Clicking the active one clears it, so the filter can
+                        // be undone where it was set rather than only from the
+                        // "All entries" row.
+                        self.kind_filter = if on { None } else { Some(*k) };
+                    }
+                }
+                ui.add_space(2.0);
+            }
+
+            // ── Tags ─────────────────────────────────────────────────────
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for r in &self.rows {
+                for t in r.tags.as_deref().unwrap_or("").split(',') {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        *counts.entry(t.to_string()).or_insert(0) += 1;
+                    }
                 }
             }
-        }
-        if !counts.is_empty() {
-            ui.add_space(12.0);
-            label(ui, "TAGS");
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            if !counts.is_empty() {
+                ui.add_space(10.0);
+                label(ui, "TAGS");
+                ui.add_space(3.0);
                 for (tag, n) in counts {
                     let on = self.tag_filter.as_deref() == Some(tag.as_str());
-                    if ui
-                        .selectable_label(
-                            on,
-                            egui::RichText::new(format!("  {tag}   {n}"))
-                                .color(if on { pal().accent } else { pal().text }),
-                        )
+                    if nav_row(ui, Some(Icon::Tag), &tag, Some(n), on, pal().accent, 2.0, true)
                         .clicked()
                     {
                         self.tag_filter = if on { None } else { Some(tag.clone()) };
                     }
                 }
-            });
-        }
-
-        ui.add_space(14.0);
-        label(ui, "HEALTH");
-        ui.add_space(4.0);
-        let report = self.security_report();
-        let sc = report.score;
-        let color = if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
-        ui.label(egui::RichText::new(format!("{sc}")).size(30.0).strong().color(color));
-        ui.add_space(2.0);
-        // Slim: this is a status line, not the subject of the pane. At full
-        // height it was a block of colour that pulled the eye away from the
-        // list, which is what the window is actually for.
-        ui.add(
-            egui::ProgressBar::new(sc as f32 / 100.0)
-                .desired_width(150.0)
-                .desired_height(5.0)
-                .fill(color),
-        );
-        ui.add_space(6.0);
-        for (n, what, c) in [
-            (report.reused, "reused", pal().danger),
-            (report.weak, "weak", pal().warn),
-            (report.stale, "over a year old", pal().muted),
-        ] {
-            if n > 0 {
-                ui.label(egui::RichText::new(format!("{n} {what}")).size(11.0).color(c));
             }
-        }
-        if report.findings.is_empty() && total > 0 {
-            ui.label(egui::RichText::new("nothing to fix").size(11.0).color(pal().ok));
-        }
+
+            // ── Health ───────────────────────────────────────────────────
+            ui.add_space(14.0);
+            label(ui, "HEALTH");
+            ui.add_space(4.0);
+            let report = self.security_report();
+            let sc = report.score;
+            let color =
+                if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
+            ui.label(egui::RichText::new(format!("{sc}")).size(30.0).strong().color(color));
+            ui.add_space(2.0);
+            // Slim: this is a status line, not the subject of the pane. At full
+            // height it was a block of colour that pulled the eye away from the
+            // list, which is what the window is actually for.
+            ui.add(
+                egui::ProgressBar::new(sc as f32 / 100.0)
+                    .desired_width(ui.available_width().min(170.0))
+                    .desired_height(5.0)
+                    .fill(color),
+            );
+            ui.add_space(6.0);
+            for (n, what, c) in [
+                (report.reused, "reused", pal().danger),
+                (report.weak, "weak", pal().warn),
+                (report.stale, "over a year old", pal().muted),
+            ] {
+                if n > 0 {
+                    ui.label(egui::RichText::new(format!("{n} {what}")).size(11.0).color(c));
+                }
+            }
+            if report.findings.is_empty() && total > 0 {
+                ui.label(egui::RichText::new("nothing to fix").size(11.0).color(pal().ok));
+            }
+            ui.add_space(8.0);
+        });
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -2308,6 +2493,42 @@ impl App {
         });
     }
 
+    /// The rows that survive the search box and the two filters.
+    ///
+    /// One implementation, because the navigation pane reports how many match
+    /// and the list shows them. Two copies of this would eventually disagree,
+    /// and the pane would confidently print a number the list contradicts.
+    fn matching_rows(&self) -> Vec<Row> {
+        let needle = self.filter.to_lowercase();
+        self.rows
+            .iter()
+            .filter(|r| {
+                // Search covers every field the user can see, so "the gmail
+                // one" is findable by name, login, address or label.
+                needle.is_empty()
+                    || r.name.to_lowercase().contains(&needle)
+                    || r.username.to_lowercase().contains(&needle)
+                    || r.uri.as_deref().unwrap_or("").to_lowercase().contains(&needle)
+                    || r.tags.as_deref().unwrap_or("").to_lowercase().contains(&needle)
+                    // The category name too: typing "card" should find the
+                    // bank cards even though no entry is called that.
+                    || r.kind.label().to_lowercase().contains(&needle)
+            })
+            .filter(|r| self.kind_filter.is_none_or(|k| r.kind == k))
+            .filter(|r| match self.tag_filter.as_deref() {
+                None => true,
+                Some("\u{2605}") => r.favorite,
+                Some(tag) => r
+                    .tags
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(',')
+                    .any(|t| t.trim() == tag),
+            })
+            .cloned()
+            .collect()
+    }
+
     fn unlocked(&mut self, ui: &mut egui::Ui) {
         match self.panel.clone() {
             Panel::Editor => return self.editor(ui),
@@ -2327,17 +2548,11 @@ impl App {
         // Wrapping, not clipping. At the widths the three panes leave, a fixed
         // row silently cut "More" down to "Mor" — a button nobody can read is a
         // button nobody presses.
+        // No search box here: it lives at the top of the navigation pane, with
+        // the categories, because narrowing by word and narrowing by kind are
+        // the same act. Moving it also gave this row the space it never had —
+        // "More" used to be clipped to "Mor".
         ui.horizontal_wrapped(|ui| {
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Search…   ( / )")
-                    .desired_width(170.0)
-                    .margin(egui::Margin::symmetric(10.0, 7.0)),
-            );
-            if self.focus_search {
-                search.request_focus();
-                self.focus_search = false;
-            }
             if icon_button(ui, Icon::Plus, "Add") {
                 self.draft = Draft::default();
                 self.panel = Panel::Editor;
@@ -2381,50 +2596,24 @@ impl App {
                     ui.close_menu();
                 }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let t = match self.sort {
-                    Sort::Name => "A–Z",
-                    Sort::Recent => "Newest",
+            // Inline, NOT in a right-aligned sub-layout. A `right_to_left`
+            // scope inside a wrapped row claims all the width still going,
+            // leaving the button before it whatever is left — which is how
+            // "More" spent two sessions being drawn as "Mor".
+            let t = match self.sort {
+                Sort::Name => "A–Z",
+                Sort::Recent => "Newest",
+            };
+            if ui.button(t).clicked() {
+                self.sort = match self.sort {
+                    Sort::Name => Sort::Recent,
+                    Sort::Recent => Sort::Name,
                 };
-                if ui.button(t).clicked() {
-                    self.sort = match self.sort {
-                        Sort::Name => Sort::Recent,
-                        Sort::Recent => Sort::Name,
-                    };
-                }
-            });
+            }
         });
         ui.add_space(10.0);
 
-        let needle = self.filter.to_lowercase();
-        let mut shown: Vec<Row> = self
-            .rows
-            .iter()
-            .filter(|r| {
-                // Search covers every field the user can see, so "the gmail
-                // one" is findable by name, login, address or label.
-                needle.is_empty()
-                    || r.name.to_lowercase().contains(&needle)
-                    || r.username.to_lowercase().contains(&needle)
-                    || r.uri.as_deref().unwrap_or("").to_lowercase().contains(&needle)
-                    || r.tags.as_deref().unwrap_or("").to_lowercase().contains(&needle)
-                    // The category name too: typing "card" should find the
-                    // bank cards even though no entry is called that.
-                    || r.kind.label().to_lowercase().contains(&needle)
-            })
-            .filter(|r| self.kind_filter.is_none_or(|k| r.kind == k))
-            .filter(|r| match self.tag_filter.as_deref() {
-                None => true,
-                Some("\u{2605}") => r.favorite,
-                Some(tag) => r
-                    .tags
-                    .as_deref()
-                    .unwrap_or("")
-                    .split(',')
-                    .any(|t| t.trim() == tag),
-            })
-            .cloned()
-            .collect();
+        let mut shown = self.matching_rows();
         match self.sort {
             Sort::Name => shown.sort_by_key(|r| r.name.to_lowercase()),
             Sort::Recent => shown.sort_by(|a, b| b.id.cmp(&a.id)),

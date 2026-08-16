@@ -108,9 +108,82 @@ impl Default for Kind {
     }
 }
 
+/// The family a category belongs to.
+///
+/// Sixteen flat headings is a list you read; four families of three to seven is
+/// a list you scan. The grouping is by what you are doing when you reach for
+/// the entry — signing in, working on a machine, paying for something, proving
+/// who you are — rather than by what the secret technically is. Someone looking
+/// for a database password is thinking "the server stuff", not "a credential
+/// with a host and a port".
+///
+/// These are presentation only. Nothing about a group is written to disk, so
+/// regrouping later costs a recompile and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    SignIn,
+    Machines,
+    Money,
+    Documents,
+}
+
+pub const GROUPS: [Group; 4] = [Group::SignIn, Group::Machines, Group::Money, Group::Documents];
+
+impl Group {
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::SignIn => "Accounts",
+            Group::Machines => "Machines & networks",
+            Group::Money => "Money",
+            Group::Documents => "Documents & keys",
+        }
+    }
+
+    /// The categories in this family, in the order they should be listed.
+    pub fn kinds(self) -> &'static [Kind] {
+        match self {
+            Group::SignIn => &[Kind::Website, Kind::Email, Kind::Authenticator],
+            Group::Machines => &[
+                Kind::Server,
+                Kind::Database,
+                Kind::SshKey,
+                Kind::ApiKey,
+                Kind::Vpn,
+                Kind::Wifi,
+                Kind::Device,
+            ],
+            Group::Money => &[Kind::BankCard, Kind::CryptoWallet],
+            Group::Documents => &[
+                Kind::Certificate,
+                Kind::RecoveryCodes,
+                Kind::SecureNote,
+                Kind::License,
+            ],
+        }
+    }
+}
+
 impl Kind {
     pub fn as_i64(self) -> i64 {
         self as i64
+    }
+
+    /// Which family this category is listed under.
+    pub fn group(self) -> Group {
+        match self {
+            Kind::Website | Kind::Email | Kind::Authenticator => Group::SignIn,
+            Kind::Server
+            | Kind::Database
+            | Kind::SshKey
+            | Kind::ApiKey
+            | Kind::Vpn
+            | Kind::Wifi
+            | Kind::Device => Group::Machines,
+            Kind::BankCard | Kind::CryptoWallet => Group::Money,
+            Kind::Certificate | Kind::RecoveryCodes | Kind::SecureNote | Kind::License => {
+                Group::Documents
+            }
+        }
     }
 
     /// An unknown number reads back as `Website` rather than failing.
@@ -435,6 +508,37 @@ mod tests {
                 || k.uses_totp()
                 || k == Kind::SecureNote; // the note itself is the content
             assert!(has_somewhere, "{} has nowhere to put anything", k.label());
+        }
+    }
+
+    #[test]
+    fn every_category_is_in_exactly_one_group() {
+        // A category in no group is invisible in the sidebar; a category in two
+        // is counted twice in the totals. Both are silent, and both make the
+        // numbers beside the headings wrong — which is worse than having no
+        // numbers, because the wrong ones are believed.
+        let mut listed: Vec<Kind> = GROUPS.iter().flat_map(|g| g.kinds().iter().copied()).collect();
+        listed.sort();
+        let mut expected = ALL.to_vec();
+        expected.sort();
+        assert_eq!(listed, expected, "a category is missing from, or repeated in, the groups");
+
+        // And the two directions must agree: `kind.group()` is what the filter
+        // uses, `group.kinds()` is what the sidebar draws.
+        for g in GROUPS {
+            for k in g.kinds() {
+                assert_eq!(k.group(), g, "{} is drawn under {} but reports {}",
+                    k.label(), g.label(), k.group().label());
+            }
+        }
+    }
+
+    #[test]
+    fn group_labels_are_unique_and_no_group_is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        for g in GROUPS {
+            assert!(seen.insert(g.label()), "duplicate group label {}", g.label());
+            assert!(!g.kinds().is_empty(), "{} has no categories", g.label());
         }
     }
 
