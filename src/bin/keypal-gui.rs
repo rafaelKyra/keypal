@@ -47,13 +47,13 @@ const DARK: Palette = Palette {
     surface: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
     surface_hi: egui::Color32::from_rgb(0x25, 0x29, 0x33),
     line: egui::Color32::from_rgb(0x2a, 0x2f, 0x3a),
-    accent: egui::Color32::from_rgb(0x6e, 0x9f, 0xff),
+    accent: egui::Color32::from_rgb(0xe8, 0xb3, 0x4a),
     text: egui::Color32::from_rgb(0xe8, 0xea, 0xef),
     muted: egui::Color32::from_rgb(0x8c, 0x93, 0xa4),
     danger: egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
     warn: egui::Color32::from_rgb(0xf0, 0xb4, 0x5f),
     ok: egui::Color32::from_rgb(0x5d, 0xd6, 0x8e),
-    on_accent: egui::Color32::from_rgb(0x11, 0x13, 0x18),
+    on_accent: egui::Color32::from_rgb(0x1a, 0x14, 0x05),
 };
 
 const LIGHT: Palette = Palette {
@@ -61,7 +61,7 @@ const LIGHT: Palette = Palette {
     surface: egui::Color32::from_rgb(0xff, 0xff, 0xff),
     surface_hi: egui::Color32::from_rgb(0xe9, 0xec, 0xf1),
     line: egui::Color32::from_rgb(0xd8, 0xdd, 0xe5),
-    accent: egui::Color32::from_rgb(0x2f, 0x6f, 0xed),
+    accent: egui::Color32::from_rgb(0xb5, 0x7c, 0x10),
     text: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
     // Darker than the dark theme's muted: grey that reads as "secondary" on
     // black is nearly invisible on white.
@@ -937,28 +937,56 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// One saturated shape in an otherwise quiet interface. Without it the header
 /// is two lines of grey text and the window has no focal point at all.
 fn logo(ui: &mut egui::Ui, size: f32) {
+    // The launcher icon's silhouette, drawn: a shield behind a key with a face.
+    // A letter tile said nothing; this is the same mark the system shows in the
+    // menu, so the application and its icon are recognisably one thing.
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let p = ui.painter();
     let c = pal();
-    ui.painter().rect_filled(rect, egui::Rounding::same(size * 0.28), c.accent);
-    // A lighter inner arc suggests depth without a real gradient, which egui
-    // cannot fill directly.
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(size, size * 0.5)),
-        egui::Rounding {
-            nw: size * 0.28,
-            ne: size * 0.28,
-            sw: 0.0,
-            se: 0.0,
-        },
-        c.accent.gamma_multiply(1.25),
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "K",
-        egui::FontId::proportional(size * 0.58),
-        c.on_accent,
-    );
+    let u = size / 24.0;
+    let at = |x: f32, y: f32| {
+        egui::pos2(rect.center().x + (x - 12.0) * u, rect.center().y + (y - 12.0) * u)
+    };
+    let shield = c.accent.gamma_multiply(0.45);
+
+    // Shield, offset right so it reads as standing BEHIND the key rather than
+    // being obscured by it.
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            at(14.0, 2.0), at(22.0, 5.5), at(22.0, 12.5),
+            at(14.0, 21.0), at(6.0, 12.5), at(6.0, 5.5),
+        ],
+        shield,
+        egui::Stroke::NONE,
+    ));
+
+    // Key bow: large, because it carries the face. The first attempt sized it
+    // to fit the grid and the eyes ended up two pixels apart at 52px.
+    p.circle_filled(at(8.6, 12.6), 6.4 * u, c.accent);
+    p.circle_filled(at(8.6, 12.6), 5.3 * u, c.accent.gamma_multiply(1.2));
+
+    // Shaft and teeth, pointing right out from behind the shield.
+    p.add(egui::Shape::convex_polygon(
+        vec![at(14.0, 11.0), at(23.0, 11.0), at(23.0, 14.2), at(14.0, 14.2)],
+        c.accent,
+        egui::Stroke::NONE,
+    ));
+    for x in [17.4_f32, 20.6] {
+        p.add(egui::Shape::convex_polygon(
+            vec![at(x, 14.2), at(x + 1.6, 14.2), at(x + 1.6, 17.0), at(x, 17.0)],
+            c.accent,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    // The face is what makes it a pal rather than a padlock.
+    let eye = (size * 0.058).max(1.2);
+    p.circle_filled(at(6.5, 11.0), eye, c.on_accent);
+    p.circle_filled(at(10.7, 11.0), eye, c.on_accent);
+    p.add(egui::Shape::line(
+        vec![at(6.2, 14.4), at(8.6, 16.2), at(11.0, 14.4)],
+        egui::Stroke::new((1.6 * u).max(1.2), c.on_accent),
+    ));
 }
 
 /// Icons drawn as shapes, not loaded as images.
