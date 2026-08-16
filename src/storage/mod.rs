@@ -590,6 +590,65 @@ impl VaultDatabase {
         Ok(n > 0)
     }
 
+    /// How long trashed entries are kept before they are shredded, in days.
+    ///
+    /// Stored per vault rather than hardcoded, because how long "long enough to
+    /// notice a mistake" is depends on how often you open the vault. Zero means
+    /// keep forever: retention that cannot be turned off is a data-loss feature.
+    pub fn retention_days(&self) -> i64 {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key='trash_retention_days'", [], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn set_retention_days(&self, days: i64) -> Result<(), crate::ValuError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('trash_retention_days', ?1)",
+            rusqlite::params![days.max(0).to_string().into_bytes()],
+        )?;
+        Ok(())
+    }
+
+    /// Shred anything that has sat in the trash past the retention window.
+    ///
+    /// Runs on unlock. Each expired entry goes through `purge_entry`, so it is
+    /// crypto-shredded rather than merely unlinked — an automatic cleanup that
+    /// left recoverable ciphertext behind would be worse than none, because the
+    /// user would believe it had been dealt with.
+    ///
+    /// Returns how many were destroyed, so the caller can say so rather than
+    /// silently deleting the user's data.
+    pub fn purge_expired_trash(
+        &self,
+        session: &KeySession,
+        now: i64,
+    ) -> Result<usize, crate::ValuError> {
+        let days = self.retention_days();
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = now - days * 24 * 60 * 60;
+        let ids: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1")?;
+            let rows = stmt.query_map([cutoff], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut destroyed = 0;
+        for id in ids {
+            if self.purge_entry(session, id)? {
+                destroyed += 1;
+            }
+        }
+        Ok(destroyed)
+    }
+
     /// Trashed entries, for the trash view.
     pub fn list_trashed(
         &self,
@@ -769,6 +828,44 @@ impl SecretStore for VaultDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_shreds_only_what_has_actually_expired() {
+        let path = tmp_db("retention");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        let session = KeySession::new(MasterKey::create_volatile().unwrap());
+        let db = VaultDatabase::open(&path, &session).unwrap();
+
+        let old = db.insert_entry(&session, "Old", "u", "p", None, None).unwrap();
+        let recent = db.insert_entry(&session, "Recent", "u", "p", None, None).unwrap();
+        let live = db.insert_entry(&session, "Live", "u", "p", None, None).unwrap();
+
+        let now = 1_700_000_000i64;
+        db.trash_entry(old).unwrap();
+        db.trash_entry(recent).unwrap();
+        // Backdate one of them past the window.
+        db.conn().execute("UPDATE entries SET deleted_at=?2 WHERE id=?1",
+            rusqlite::params![old, now - 40 * 86_400]).unwrap();
+        db.conn().execute("UPDATE entries SET deleted_at=?2 WHERE id=?1",
+            rusqlite::params![recent, now - 2 * 86_400]).unwrap();
+
+        // Off by default: a retention that cannot be turned off is a data-loss
+        // feature, so nothing must vanish until the user asks for it.
+        assert_eq!(db.retention_days(), 0);
+        assert_eq!(db.purge_expired_trash(&session, now).unwrap(), 0);
+
+        db.set_retention_days(30).unwrap();
+        assert_eq!(db.retention_days(), 30);
+        assert_eq!(db.purge_expired_trash(&session, now).unwrap(), 1);
+
+        assert!(db.get_entry(&session, old).unwrap().is_none(), "expired one is gone");
+        assert!(db.get_entry(&session, recent).unwrap().is_some(), "recent one is kept");
+        assert!(db.get_entry(&session, live).unwrap().is_some(), "live entry untouched");
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+    }
+
 
     #[test]
     fn the_access_log_records_ids_but_never_names() {

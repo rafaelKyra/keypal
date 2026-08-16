@@ -18,16 +18,74 @@ use valu::storage::VaultDatabase;
 use valu::totp;
 
 // ── Palette ─────────────────────────────────────────────────────────────────
-const BG: egui::Color32 = egui::Color32::from_rgb(0x11, 0x13, 0x18);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1d, 0x24);
-const SURFACE_HI: egui::Color32 = egui::Color32::from_rgb(0x25, 0x29, 0x33);
-const LINE: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2f, 0x3a);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x9f, 0xff);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xea, 0xef);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0x8c, 0x93, 0xa4);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(0xff, 0x6b, 0x6b);
-const WARN: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xb4, 0x5f);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x5d, 0xd6, 0x8e);
+//
+// Two themes, one set of roles. Naming the roles rather than the colours means
+// every widget below is written once: swapping the theme swaps the values, not
+// the code — and no screen can drift into a hardcoded colour that stays dark
+// when everything around it turns light.
+
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: egui::Color32,
+    surface: egui::Color32,
+    surface_hi: egui::Color32,
+    line: egui::Color32,
+    accent: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    danger: egui::Color32,
+    warn: egui::Color32,
+    ok: egui::Color32,
+    /// Text drawn ON the accent colour. Dark on a light theme, and vice versa —
+    /// the one value that must not simply follow `text`, or primary buttons
+    /// become unreadable.
+    on_accent: egui::Color32,
+}
+
+const DARK: Palette = Palette {
+    bg: egui::Color32::from_rgb(0x11, 0x13, 0x18),
+    surface: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
+    surface_hi: egui::Color32::from_rgb(0x25, 0x29, 0x33),
+    line: egui::Color32::from_rgb(0x2a, 0x2f, 0x3a),
+    accent: egui::Color32::from_rgb(0x6e, 0x9f, 0xff),
+    text: egui::Color32::from_rgb(0xe8, 0xea, 0xef),
+    muted: egui::Color32::from_rgb(0x8c, 0x93, 0xa4),
+    danger: egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
+    warn: egui::Color32::from_rgb(0xf0, 0xb4, 0x5f),
+    ok: egui::Color32::from_rgb(0x5d, 0xd6, 0x8e),
+    on_accent: egui::Color32::from_rgb(0x11, 0x13, 0x18),
+};
+
+const LIGHT: Palette = Palette {
+    bg: egui::Color32::from_rgb(0xf6, 0xf7, 0xf9),
+    surface: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+    surface_hi: egui::Color32::from_rgb(0xe9, 0xec, 0xf1),
+    line: egui::Color32::from_rgb(0xd8, 0xdd, 0xe5),
+    accent: egui::Color32::from_rgb(0x2f, 0x6f, 0xed),
+    text: egui::Color32::from_rgb(0x1a, 0x1d, 0x24),
+    // Darker than the dark theme's muted: grey that reads as "secondary" on
+    // black is nearly invisible on white.
+    muted: egui::Color32::from_rgb(0x5f, 0x67, 0x76),
+    danger: egui::Color32::from_rgb(0xc0, 0x28, 0x28),
+    warn: egui::Color32::from_rgb(0xa8, 0x86, 0x0a),
+    ok: egui::Color32::from_rgb(0x1a, 0x7f, 0x4b),
+    on_accent: egui::Color32::from_rgb(0xff, 0xff, 0xff),
+};
+
+// The palette in force. Set when the theme changes, read by every helper.
+// Thread-local rather than `static mut`: egui draws on one thread, so this is
+// both correct and free, and it needs no `unsafe`.
+thread_local! {
+    static PALETTE: std::cell::Cell<Palette> = const { std::cell::Cell::new(DARK) };
+}
+
+fn pal() -> Palette {
+    PALETTE.with(|c| c.get())
+}
+
+fn set_palette(light: bool) {
+    PALETTE.with(|c| c.set(if light { LIGHT } else { DARK }));
+}
 
 /// How long a copied secret may sit in the clipboard.
 ///
@@ -61,6 +119,7 @@ enum Panel {
     Confirm(i64, String),
     ConfirmPurge(i64, String),
     ChangePass,
+    Settings,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -126,6 +185,8 @@ struct App {
     csv_path: String,
     export_path: String,
     keyfile_path: String,
+    retention_input: String,
+    light: bool,
     trash_rows: Vec<(i64, String)>,
     history_rows: Vec<(i64, String, Option<String>)>,
     change_old: String,
@@ -168,6 +229,8 @@ impl Default for App {
             csv_path: String::new(),
             export_path: home().join("valu-export.csv").display().to_string(),
             keyfile_path: String::new(),
+            retention_input: "0".into(),
+            light: false,
             trash_rows: Vec::new(),
             history_rows: Vec::new(),
             change_old: String::new(),
@@ -299,7 +362,7 @@ fn generate_password() -> String {
 /// terrible — so the label always says "estimate".
 fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.is_empty() {
-        return (0.0, "", MUTED);
+        return (0.0, "", pal().muted);
     }
     let mut classes = 0u32;
     if password.chars().any(|c| c.is_ascii_lowercase()) { classes += 26; }
@@ -308,10 +371,10 @@ fn strength(password: &str) -> (f32, &'static str, egui::Color32) {
     if password.chars().any(|c| !c.is_ascii_alphanumeric()) { classes += 33; }
     let bits = password.chars().count() as f32 * (classes.max(2) as f32).log2();
     match bits as u32 {
-        0..=45 => (bits, "weak", DANGER),
-        46..=69 => (bits, "fair", WARN),
-        70..=99 => (bits, "good", OK),
-        _ => (bits, "strong", OK),
+        0..=45 => (bits, "weak", pal().danger),
+        46..=69 => (bits, "fair", pal().warn),
+        70..=99 => (bits, "good", pal().ok),
+        _ => (bits, "strong", pal().ok),
     }
 }
 
@@ -459,13 +522,36 @@ impl App {
                 self.db = Some(db);
                 self.session = Some(session);
                 self.vault_path = Some(path);
+                // Retention runs here, once, on a vault we have just proven we
+                // can decrypt — shredding needs the wipe key, so it cannot run
+                // while locked.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let shredded = match (self.db.as_ref(), self.session.as_ref()) {
+                    (Some(db), Some(session)) => {
+                        db.log_access(None, "unlock");
+                        db.purge_expired_trash(session, now).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
                 self.reload();
                 let n = self.rows.len();
                 self.panel = Panel::List;
                 self.open_entry = None;
                 self.filter.clear();
                 self.last_input = Instant::now();
-                self.set(format!("Unlocked — {n} entries"), Level::Ok);
+                // Said out loud: silently destroying the user's data, even data
+                // they trashed, is how a cleanup feature becomes a betrayal.
+                self.set(
+                    if shredded > 0 {
+                        format!("Unlocked — {n} entries ({shredded} shredded from trash)")
+                    } else {
+                        format!("Unlocked — {n} entries")
+                    },
+                    Level::Ok,
+                );
             }
             Err(why) => {
                 self.db = None;
@@ -690,15 +776,17 @@ impl App {
 
 // ── Styling ─────────────────────────────────────────────────────────────────
 
-fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = BG;
+fn apply_theme(ctx: &egui::Context, light: bool) {
+    set_palette(light);
+    let c = pal();
+    let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    v.panel_fill = c.bg;
+    v.window_fill = c.bg;
     v.extreme_bg_color = egui::Color32::from_rgb(0x0d, 0x0f, 0x13);
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    v.hyperlink_color = ACCENT;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, LINE);
+    v.override_text_color = Some(c.text);
+    v.selection.bg_fill = c.accent.linear_multiply(0.35);
+    v.hyperlink_color = c.accent;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, c.line);
 
     let r = egui::Rounding::same(9.0);
     for w in [
@@ -709,12 +797,12 @@ fn apply_theme(ctx: &egui::Context) {
     ] {
         w.rounding = r;
     }
-    v.widgets.inactive.bg_fill = SURFACE_HI;
-    v.widgets.inactive.weak_bg_fill = SURFACE_HI;
-    v.widgets.hovered.bg_fill = ACCENT.linear_multiply(0.5);
-    v.widgets.hovered.weak_bg_fill = ACCENT.linear_multiply(0.5);
-    v.widgets.active.bg_fill = ACCENT;
-    v.widgets.active.weak_bg_fill = ACCENT;
+    v.widgets.inactive.bg_fill = c.surface_hi;
+    v.widgets.inactive.weak_bg_fill = c.surface_hi;
+    v.widgets.hovered.bg_fill = c.accent.linear_multiply(0.5);
+    v.widgets.hovered.weak_bg_fill = c.accent.linear_multiply(0.5);
+    v.widgets.active.bg_fill = c.accent;
+    v.widgets.active.weak_bg_fill = c.accent;
     ctx.set_visuals(v);
 
     let mut s = (*ctx.style()).clone();
@@ -726,7 +814,7 @@ fn apply_theme(ctx: &egui::Context) {
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
-        .fill(SURFACE)
+        .fill(pal().surface)
         .rounding(egui::Rounding::same(13.0))
         .inner_margin(egui::Margin::same(16.0))
         .show(ui, add)
@@ -734,7 +822,7 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(12.0).color(MUTED));
+    ui.label(egui::RichText::new(text).size(12.0).color(pal().muted));
 }
 
 fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, secret: bool) -> egui::Response {
@@ -750,7 +838,8 @@ fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, secret: bool) -> egu
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add_sized(
         [130.0, 34.0],
-        egui::Button::new(egui::RichText::new(text).size(14.0).strong().color(BG)).fill(ACCENT),
+        egui::Button::new(egui::RichText::new(text).size(14.0).strong().color(pal().on_accent))
+            .fill(pal().accent),
     )
     .clicked()
 }
@@ -838,18 +927,18 @@ impl eframe::App for App {
         let browsing = self.db.is_some() && self.panel == Panel::List;
 
         egui::TopBottomPanel::top("head")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(20.0, 14.0)))
+            .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(20.0, 14.0)))
             .show(ctx, |ui| self.header(ui));
 
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::none().fill(SURFACE).inner_margin(egui::Margin::symmetric(20.0, 8.0)))
+            .frame(egui::Frame::none().fill(pal().surface).inner_margin(egui::Margin::symmetric(20.0, 8.0)))
             .show(ctx, |ui| self.status_bar(ui));
 
         if browsing {
             egui::SidePanel::left("nav")
                 .resizable(true)
                 .default_width(210.0)
-                .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
+                .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
                 .show(ctx, |ui| self.sidebar(ui));
 
             // The detail pane holds a copy of the selected row rather than a
@@ -864,7 +953,7 @@ impl eframe::App for App {
                     .default_width(330.0)
                     .frame(
                         egui::Frame::none()
-                            .fill(BG)
+                            .fill(pal().bg)
                             .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
                     )
                     .show(ctx, |ui| {
@@ -874,7 +963,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
+            .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
             .show(ctx, |ui| {
                 if self.db.is_some() {
                     self.unlocked(ui);
@@ -898,13 +987,13 @@ impl App {
         ui.horizontal(|ui| {
             if !self.status.is_empty() {
                 let color = match self.level {
-                    Level::Ok => OK,
-                    Level::Bad => DANGER,
-                    Level::None => MUTED,
+                    Level::Ok => pal().ok,
+                    Level::Bad => pal().danger,
+                    Level::None => pal().muted,
                 };
                 ui.label(egui::RichText::new(&self.status).size(12.0).color(color));
             } else if let Some(p) = &self.vault_path {
-                ui.label(egui::RichText::new(p.display().to_string()).size(11.0).color(MUTED));
+                ui.label(egui::RichText::new(p.display().to_string()).size(11.0).color(pal().muted));
             }
 
             if self.db.is_some() {
@@ -912,7 +1001,7 @@ impl App {
                     let left = IDLE_LOCK.saturating_sub(self.last_input.elapsed()).as_secs();
                     let (m, sec) = (left / 60, left % 60);
                     // Warn while there is still time to do something about it.
-                    let color = if left <= 60 { WARN } else { MUTED };
+                    let color = if left <= 60 { pal().warn } else { pal().muted };
                     ui.label(
                         egui::RichText::new(format!("locks in {m}:{sec:02}"))
                             .size(12.0)
@@ -921,7 +1010,7 @@ impl App {
                     ui.add_space(12.0);
                     let report = self.security_report();
                     let sc = report.score;
-                    let color = if sc >= 85 { OK } else if sc >= 60 { WARN } else { DANGER };
+                    let color = if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
                     ui.label(
                         egui::RichText::new(format!("health {sc}"))
                             .size(12.0)
@@ -965,7 +1054,7 @@ impl App {
             .selectable_label(
                 all_selected,
                 egui::RichText::new(format!("  All entries   {total}"))
-                    .color(if all_selected { ACCENT } else { TEXT }),
+                    .color(if all_selected { pal().accent } else { pal().text }),
             )
             .clicked()
         {
@@ -979,7 +1068,7 @@ impl App {
                 .selectable_label(
                     on,
                     egui::RichText::new(format!("  Favourites   {favs}"))
-                        .color(if on { ACCENT } else { TEXT }),
+                        .color(if on { pal().accent } else { pal().text }),
                 )
                 .clicked()
             {
@@ -1009,7 +1098,7 @@ impl App {
                         .selectable_label(
                             on,
                             egui::RichText::new(format!("  {tag}   {n}"))
-                                .color(if on { ACCENT } else { TEXT }),
+                                .color(if on { pal().accent } else { pal().text }),
                         )
                         .clicked()
                     {
@@ -1024,7 +1113,7 @@ impl App {
         ui.add_space(4.0);
         let report = self.security_report();
         let sc = report.score;
-        let color = if sc >= 85 { OK } else if sc >= 60 { WARN } else { DANGER };
+        let color = if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
         ui.label(egui::RichText::new(format!("{sc}/100")).size(22.0).strong().color(color));
         ui.add(
             egui::ProgressBar::new(sc as f32 / 100.0)
@@ -1033,24 +1122,24 @@ impl App {
         );
         ui.add_space(6.0);
         for (n, what, c) in [
-            (report.reused, "reused", DANGER),
-            (report.weak, "weak", WARN),
-            (report.stale, "over a year old", MUTED),
+            (report.reused, "reused", pal().danger),
+            (report.weak, "weak", pal().warn),
+            (report.stale, "over a year old", pal().muted),
         ] {
             if n > 0 {
                 ui.label(egui::RichText::new(format!("{n} {what}")).size(11.0).color(c));
             }
         }
         if report.findings.is_empty() && total > 0 {
-            ui.label(egui::RichText::new("nothing to fix").size(11.0).color(OK));
+            ui.label(egui::RichText::new("nothing to fix").size(11.0).color(pal().ok));
         }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("VALU").size(26.0).strong().color(TEXT));
+            ui.label(egui::RichText::new("VALU").size(26.0).strong().color(pal().text));
             ui.add_space(2.0);
-            ui.label(egui::RichText::new("password vault").size(12.0).color(MUTED));
+            ui.label(egui::RichText::new("password vault").size(12.0).color(pal().muted));
             if self.db.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Lock").clicked() {
@@ -1070,7 +1159,7 @@ impl App {
             label(ui, "YOUR VAULTS");
             ui.add_space(4.0);
             if self.vaults.is_empty() {
-                ui.label(egui::RichText::new("None found in your home folder.").color(MUTED));
+                ui.label(egui::RichText::new("None found in your home folder.").color(pal().muted));
             } else {
                 let vaults = self.vaults.clone();
                 egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
@@ -1081,9 +1170,9 @@ impl App {
                             .unwrap_or_else(|| path.display().to_string());
                         let chosen = self.selected.as_ref() == Some(&path);
                         let t = if chosen {
-                            egui::RichText::new(format!("  {name}")).color(ACCENT).strong()
+                            egui::RichText::new(format!("  {name}")).color(pal().accent).strong()
                         } else {
-                            egui::RichText::new(format!("  {name}")).color(TEXT)
+                            egui::RichText::new(format!("  {name}")).color(pal().text)
                         };
                         if ui.selectable_label(chosen, t).clicked() {
                             self.selected = Some(path.clone());
@@ -1111,7 +1200,7 @@ impl App {
                      vault is gone — that is what makes it a second factor.",
                 )
                 .size(11.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
 
             ui.add_space(8.0);
@@ -1119,12 +1208,12 @@ impl App {
                 Some(p) => ui.label(
                     egui::RichText::new(format!("Will open: {}", p.display()))
                         .size(11.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                 ),
                 None => ui.label(
                     egui::RichText::new("Pick a vault above, or type a path")
                         .size(11.0)
-                        .color(WARN),
+                        .color(pal().warn),
                 ),
             };
 
@@ -1165,7 +1254,7 @@ impl App {
                     "There is no recovery. Lose this passphrase and the vault is gone.",
                 )
                 .size(12.0)
-                .color(WARN),
+                .color(pal().warn),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -1193,6 +1282,7 @@ impl App {
             Panel::Export => return self.export_view(ui),
             Panel::History(id) => return self.history_view(ui, id),
             Panel::Trash => return self.trash_view(ui),
+            Panel::Settings => return self.settings_view(ui),
             Panel::List => {}
         }
 
@@ -1234,6 +1324,15 @@ impl App {
                 }
                 if ui.button("Change passphrase…").clicked() {
                     self.panel = Panel::ChangePass;
+                    ui.close_menu();
+                }
+                if ui.button("Settings…").clicked() {
+                    self.retention_input = self
+                        .db
+                        .as_ref()
+                        .map(|d| d.retention_days().to_string())
+                        .unwrap_or_else(|| "0".into());
+                    self.panel = Panel::Settings;
                     ui.close_menu();
                 }
             });
@@ -1286,12 +1385,12 @@ impl App {
         card(ui, |ui| {
             if total == 0 {
                 ui.label(
-                    egui::RichText::new("This vault is empty. Add an entry to begin.").color(MUTED),
+                    egui::RichText::new("This vault is empty. Add an entry to begin.").color(pal().muted),
                 );
                 return;
             }
             if shown.is_empty() {
-                ui.label(egui::RichText::new("Nothing matches that search").color(MUTED));
+                ui.label(egui::RichText::new("Nothing matches that search").color(pal().muted));
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1308,7 +1407,7 @@ impl App {
                                 sub.push_str("• 2FA");
                             }
                             if !sub.trim().is_empty() {
-                                ui.label(egui::RichText::new(sub).size(11.0).color(MUTED));
+                                ui.label(egui::RichText::new(sub).size(11.0).color(pal().muted));
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1332,12 +1431,12 @@ impl App {
         let mut copy_now: Option<String> = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(ACCENT));
+                ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         self.open_entry = None;
                     }
-                    if ui.button(egui::RichText::new("Delete").color(DANGER)).clicked() {
+                    if ui.button(egui::RichText::new("Delete").color(pal().danger)).clicked() {
                         self.panel = Panel::Confirm(row.id, row.name.clone());
                     }
                     if ui.button("History").clicked() {
@@ -1415,11 +1514,11 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     for t in tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                         egui::Frame::none()
-                            .fill(SURFACE_HI)
+                            .fill(pal().surface_hi)
                             .rounding(egui::Rounding::same(10.0))
                             .inner_margin(egui::Margin::symmetric(8.0, 3.0))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(t).size(11.0).color(ACCENT));
+                                ui.label(egui::RichText::new(t).size(11.0).color(pal().accent));
                             });
                     }
                 });
@@ -1455,7 +1554,7 @@ impl App {
                                     .size(24.0)
                                     .monospace()
                                     .strong()
-                                    .color(if hot { WARN } else { OK }),
+                                    .color(if hot { pal().warn } else { pal().ok }),
                             );
                             if ui.small_button("Copy").clicked() {
                                 copy_now = Some(code.clone());
@@ -1463,19 +1562,19 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("{left}s"))
                                     .size(12.0)
-                                    .color(if hot { WARN } else { MUTED }),
+                                    .color(if hot { pal().warn } else { pal().muted }),
                             );
                         });
                         ui.add(
                             egui::ProgressBar::new(left as f32 / totp::PERIOD as f32)
                                 .desired_width(200.0)
-                                .fill(if hot { WARN } else { ACCENT }),
+                                .fill(if hot { pal().warn } else { pal().accent }),
                         );
                     }
                     Err(_) => {
                         ui.label(
                             egui::RichText::new("stored two-factor secret is unreadable")
-                                .color(DANGER),
+                                .color(pal().danger),
                         );
                     }
                 }
@@ -1567,7 +1666,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Paste what the site shows next to its QR code.")
                     .size(11.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
 
             ui.add_space(12.0);
@@ -1597,13 +1696,13 @@ impl App {
                 egui::RichText::new("Newest first. Restoring puts the old password back and \
                                      records the current one in its place.")
                     .size(12.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
             ui.add_space(10.0);
 
             if self.history_rows.is_empty() {
                 ui.label(
-                    egui::RichText::new("This password has never been changed.").color(MUTED),
+                    egui::RichText::new("This password has never been changed.").color(pal().muted),
                 );
             } else {
                 let rows = self.history_rows.clone();
@@ -1612,7 +1711,7 @@ impl App {
                     for (n, (when, old, reason)) in rows.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("{}.", n + 1)).size(12.0).color(MUTED),
+                                egui::RichText::new(format!("{}.", n + 1)).size(12.0).color(pal().muted),
                             );
                             // Masked by default: an old password is usually
                             // still in use somewhere else.
@@ -1621,7 +1720,7 @@ impl App {
                                     .monospace(),
                             );
                             ui.label(
-                                egui::RichText::new(format_when(*when)).size(11.0).color(MUTED),
+                                egui::RichText::new(format_when(*when)).size(11.0).color(pal().muted),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1637,7 +1736,7 @@ impl App {
                         });
                         if let Some(why) = reason.as_deref().filter(|r| !r.is_empty()) {
                             ui.label(
-                                egui::RichText::new(format!("    {why}")).size(11.0).color(MUTED),
+                                egui::RichText::new(format!("    {why}")).size(11.0).color(pal().muted),
                             );
                         }
                         ui.separator();
@@ -1694,12 +1793,12 @@ impl App {
                     "Deleted entries stay here until you empty it. Emptying cannot be undone.",
                 )
                 .size(12.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(10.0);
 
             if self.trash_rows.is_empty() {
-                ui.label(egui::RichText::new("The trash is empty.").color(MUTED));
+                ui.label(egui::RichText::new("The trash is empty.").color(pal().muted));
             } else {
                 let rows = self.trash_rows.clone();
                 let (mut restore, mut purge): (Option<i64>, Option<(i64, String)>) = (None, None);
@@ -1712,7 +1811,7 @@ impl App {
                                 |ui| {
                                     if ui
                                         .small_button(
-                                            egui::RichText::new("Delete forever").color(DANGER),
+                                            egui::RichText::new("Delete forever").color(pal().danger),
                                         )
                                         .clicked()
                                     {
@@ -1770,7 +1869,7 @@ impl App {
                      detected from the header row.",
                 )
                 .size(12.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(4.0);
             ui.label(
@@ -1779,7 +1878,7 @@ impl App {
                      import is done.",
                 )
                 .size(12.0)
-                .color(WARN),
+                .color(pal().warn),
             );
             ui.add_space(10.0);
             label(ui, "CSV FILE");
@@ -1841,7 +1940,7 @@ impl App {
                      keep on a USB stick.",
                 )
                 .size(12.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(6.0);
             if ui.button("Create backup now").clicked() {
@@ -1859,7 +1958,7 @@ impl App {
                      to another manager — delete it immediately afterwards.",
                 )
                 .size(12.0)
-                .color(DANGER),
+                .color(pal().danger),
             );
             ui.add_space(6.0);
             field(ui, &mut self.export_path, "/home/you/valu-export.csv", false);
@@ -1868,9 +1967,9 @@ impl App {
                 .add_sized(
                     [190.0, 32.0],
                     egui::Button::new(
-                        egui::RichText::new("Export unencrypted CSV").size(13.0).color(BG),
+                        egui::RichText::new("Export unencrypted CSV").size(13.0).color(pal().on_accent),
                     )
-                    .fill(DANGER),
+                    .fill(pal().danger),
                 )
                 .clicked()
             {
@@ -1934,7 +2033,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Entries are copied in; the .kdbx file is left untouched.")
                     .size(12.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
             ui.add_space(8.0);
             label(ui, "KDBX FILE");
@@ -1963,7 +2062,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Every entry is re-encrypted under the new key.")
                     .size(12.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
             ui.add_space(8.0);
             label(ui, "CURRENT");
@@ -1992,13 +2091,111 @@ impl App {
         });
     }
 
+    fn settings_view(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("Settings").size(17.0).strong());
+            ui.add_space(10.0);
+
+            label(ui, "TRASH RETENTION");
+            ui.label(
+                egui::RichText::new(
+                    "Days before a trashed entry is shredded automatically on unlock. \
+                     0 keeps everything until you empty the trash yourself.",
+                )
+                .size(12.0)
+                .color(pal().muted),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.retention_input)
+                        .desired_width(70.0)
+                        .margin(egui::Margin::symmetric(10.0, 7.0)),
+                );
+                ui.label(egui::RichText::new("days").size(12.0).color(pal().muted));
+                if ui.button("Save").clicked() {
+                    match self.retention_input.trim().parse::<i64>() {
+                        Ok(d) if d >= 0 => {
+                            if let Some(db) = self.db.as_ref() {
+                                let _ = db.set_retention_days(d);
+                            }
+                            self.set(
+                                if d == 0 {
+                                    "Trash kept until emptied by hand".to_string()
+                                } else {
+                                    format!("Trash shredded after {d} days")
+                                },
+                                Level::Ok,
+                            );
+                        }
+                        _ => self.set("Give a whole number of days", Level::Bad),
+                    }
+                }
+            });
+
+            ui.add_space(16.0);
+            label(ui, "APPEARANCE");
+            ui.add_space(4.0);
+            if ui
+                .checkbox(&mut self.light, "Light theme")
+                .changed()
+            {
+                apply_theme(ui.ctx(), self.light);
+            }
+
+            ui.add_space(16.0);
+            label(ui, "RECENT ACTIVITY");
+            ui.label(
+                egui::RichText::new(
+                    "Entry ids only — a log of names would be a plaintext index of the \
+                     vault sitting beside the ciphertext.",
+                )
+                .size(11.0)
+                .color(pal().muted),
+            );
+            ui.add_space(4.0);
+            let log = self
+                .db
+                .as_ref()
+                .and_then(|db| db.recent_access(12).ok())
+                .unwrap_or_default();
+            if log.is_empty() {
+                ui.label(egui::RichText::new("Nothing recorded yet.").size(12.0).color(pal().muted));
+            } else {
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    for (at, entry, action) in log {
+                        let who = match entry {
+                            Some(id) => self
+                                .rows
+                                .iter()
+                                .find(|r| r.id == id)
+                                .map(|r| r.name.clone())
+                                .unwrap_or_else(|| format!("entry {id}")),
+                            None => "vault".to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{}   {action}   {who}", format_when(at)))
+                                .size(11.0)
+                                .color(pal().muted),
+                        );
+                    }
+                });
+            }
+
+            ui.add_space(14.0);
+            if ui.button("Done").clicked() {
+                self.panel = Panel::List;
+            }
+        });
+    }
+
     fn confirm_purge(&mut self, ui: &mut egui::Ui, id: i64, name: &str) {
         card(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!("Destroy “{name}” for good?"))
                     .size(17.0)
                     .strong()
-                    .color(DANGER),
+                    .color(pal().danger),
             );
             ui.add_space(6.0);
             ui.label(
@@ -2008,13 +2205,13 @@ impl App {
                      key dies when you lock the vault.",
                 )
                 .size(12.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("There is no undo, and no recovery from a backup made after this.")
                     .size(12.0)
-                    .color(WARN),
+                    .color(pal().warn),
             );
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -2022,9 +2219,9 @@ impl App {
                     .add_sized(
                         [150.0, 34.0],
                         egui::Button::new(
-                            egui::RichText::new("Destroy").size(14.0).strong().color(BG),
+                            egui::RichText::new("Destroy").size(14.0).strong().color(pal().on_accent),
                         )
-                        .fill(DANGER),
+                        .fill(pal().danger),
                     )
                     .clicked()
                 {
@@ -2061,19 +2258,19 @@ impl App {
                 egui::RichText::new(format!("Delete “{name}”?"))
                     .size(17.0)
                     .strong()
-                    .color(DANGER),
+                    .color(pal().danger),
             );
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("This cannot be undone.").size(12.0).color(MUTED));
+            ui.label(egui::RichText::new("This cannot be undone.").size(12.0).color(pal().muted));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui
                     .add_sized(
                         [120.0, 34.0],
                         egui::Button::new(
-                            egui::RichText::new("Delete").size(14.0).strong().color(BG),
+                            egui::RichText::new("Delete").size(14.0).strong().color(pal().on_accent),
                         )
-                        .fill(DANGER),
+                        .fill(pal().danger),
                     )
                     .clicked()
                 {
@@ -2100,7 +2297,7 @@ fn main() -> eframe::Result {
         "VALU",
         options,
         Box::new(|cc| {
-            apply_theme(&cc.egui_ctx);
+            apply_theme(&cc.egui_ctx, false);
             Ok(Box::new(App::default()))
         }),
     )
