@@ -812,6 +812,21 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
     ctx.set_style(s);
 }
 
+/// A form laid out at a readable width instead of stretched across the window.
+///
+/// A 400px field spread over 1800px of window is not more usable for being
+/// bigger — the eye loses the line, and the empty space reads as a broken
+/// layout. Every modal panel goes through this so they all share one measure.
+fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    const MEASURE: f32 = 560.0;
+    let width = ui.available_width().min(MEASURE);
+    ui.vertical(|ui| {
+        ui.set_max_width(width);
+        card(ui, add)
+    })
+    .inner
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
         .fill(pal().surface)
@@ -1231,7 +1246,7 @@ impl App {
     }
 
     fn create_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("New vault").size(17.0).strong());
             ui.add_space(8.0);
             label(ui, "FILE");
@@ -1430,9 +1445,14 @@ impl App {
     fn detail(&mut self, ui: &mut egui::Ui, row: &Row) {
         let mut copy_now: Option<String> = None;
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Name on its own line. Sharing a row with four buttons meant the
+            // name was the thing that got clipped — the one label that tells
+            // you which entry you are looking at.
+            ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
+            ui.add_space(6.0);
+            // Reading order, not reverse: Edit is the common action and comes
+            // first; Close last, where a dismiss belongs.
+            ui.horizontal_wrapped(|ui| {
                     if ui.button("Close").clicked() {
                         self.open_entry = None;
                     }
@@ -1457,7 +1477,6 @@ impl App {
                         };
                         self.panel = Panel::Editor;
                     }
-                });
             });
             ui.add_space(8.0);
 
@@ -1589,7 +1608,7 @@ impl App {
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             let editing = self.draft.id.is_some();
             ui.label(
                 egui::RichText::new(if editing { "Edit entry" } else { "New entry" })
@@ -1689,7 +1708,7 @@ impl App {
             .find(|r| r.id == id)
             .map(|r| r.name.clone())
             .unwrap_or_default();
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new(format!("Password history — {name}")).size(17.0).strong());
             ui.add_space(4.0);
             ui.label(
@@ -1785,7 +1804,7 @@ impl App {
     }
 
     fn trash_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Trash").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(
@@ -1860,7 +1879,7 @@ impl App {
     }
 
     fn import_csv_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Import a CSV export").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(
@@ -1929,7 +1948,7 @@ impl App {
     }
 
     fn export_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Export and backup").size(17.0).strong());
             ui.add_space(8.0);
 
@@ -2027,7 +2046,7 @@ impl App {
     }
 
     fn import_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Import from KeePass").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(
@@ -2056,7 +2075,7 @@ impl App {
     }
 
     fn change_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Change passphrase").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(
@@ -2092,7 +2111,7 @@ impl App {
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(egui::RichText::new("Settings").size(17.0).strong());
             ui.add_space(10.0);
 
@@ -2190,7 +2209,7 @@ impl App {
     }
 
     fn confirm_purge(&mut self, ui: &mut egui::Ui, id: i64, name: &str) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!("Destroy “{name}” for good?"))
                     .size(17.0)
@@ -2253,7 +2272,7 @@ impl App {
     }
 
     fn confirm(&mut self, ui: &mut egui::Ui, id: i64, name: &str) {
-        card(ui, |ui| {
+        form(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!("Delete “{name}”?"))
                     .size(17.0)
