@@ -52,6 +52,14 @@ hmac = "0.12"
 sha1 = "0.10"
 base32 = "0.5"
 
+[[bin]]
+name = "keypal"
+path = "src/main.rs"
+
+[[bin]]
+name = "keypal-gui"
+path = "src/bin/keypal-gui.rs"
+
 [dev-dependencies]
 criterion = "0.5"
 

@@ -120,6 +120,7 @@ enum Panel {
     ConfirmPurge(i64, String),
     ChangePass,
     Settings,
+    Help,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -179,6 +180,7 @@ struct App {
     reveal_password: bool,
     reveal_notes: bool,
     focus_search: bool,
+    show_help_locked: bool,
     draft: Draft,
     import_path: String,
     import_pass: String,
@@ -223,11 +225,16 @@ impl Default for App {
             reveal_password: false,
             reveal_notes: false,
             focus_search: false,
+            show_help_locked: false,
             draft: Draft::default(),
             import_path: String::new(),
             import_pass: String::new(),
             csv_path: String::new(),
-            export_path: home().join("valu-export.csv").display().to_string(),
+            export_path: portable_root()
+                .unwrap_or_else(home)
+                .join("keypal-export.csv")
+                .display()
+                .to_string(),
             keyfile_path: String::new(),
             retention_input: "0".into(),
             light: false,
@@ -253,7 +260,7 @@ impl Default for App {
 /// with "a file already exists there", which reads as a dead end rather than as
 /// a suggestion to rename.
 fn free_vault_path() -> String {
-    let base = home();
+    let base = portable_root().unwrap_or_else(home);
     let first = base.join("vault.db");
     if !first.exists() {
         return first.display().to_string();
@@ -290,10 +297,46 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
+/// True when the application is running as a portable install.
+///
+/// Marked by a `.keypal-portable` file beside the executable, which is the only
+/// signal that cannot be faked by where the user happens to have launched from.
+/// In portable mode nothing outside the medium is read or written: the point of
+/// carrying a vault on a stick is that the machine you plug it into keeps no
+/// trace, and scanning $HOME would defeat that on the first run.
+fn portable_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    if dir.join(".keypal-portable").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// Find vaults so the user never has to type a path. A vault is a SQLite file
 /// with an `argon_salt` row in `meta` — the row unlocking needs — so this finds
 /// real vaults rather than every .db lying around.
 fn discover_vaults() -> Vec<PathBuf> {
+    if let Some(root) = portable_root() {
+        let mut found = Vec::new();
+        for dir in [root.clone(), root.join("vaults")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for item in entries.flatten() {
+                let path = item.path();
+                if path.is_file()
+                    && path.extension().map(|e| e == "db" || e == "vault").unwrap_or(false)
+                    && looks_like_vault(&path)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        return found;
+    }
+
     let h = home();
     let mut roots = vec![h.clone()];
     for sub in ["Documents", "Desktop", ".local/share/valu"] {
@@ -827,13 +870,94 @@ fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     .inner
 }
 
+/// A raised surface.
+///
+/// Fill alone is not enough separation on a dark theme: two greys a few points
+/// apart read as one flat plane. A hairline plus a soft shadow gives the card
+/// an edge and a little height, which is what makes an interface look built
+/// rather than drawn.
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
         .fill(pal().surface)
-        .rounding(egui::Rounding::same(13.0))
-        .inner_margin(egui::Margin::same(16.0))
+        .rounding(egui::Rounding::same(14.0))
+        .stroke(egui::Stroke::new(1.0_f32, pal().line))
+        .shadow(egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 2.0),
+            blur: 12.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(60),
+        })
+        .inner_margin(egui::Margin::same(18.0))
         .show(ui, add)
         .inner
+}
+
+/// The app mark: a rounded accent tile with the initial.
+///
+/// One saturated shape in an otherwise quiet interface. Without it the header
+/// is two lines of grey text and the window has no focal point at all.
+fn logo(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let c = pal();
+    ui.painter().rect_filled(rect, egui::Rounding::same(size * 0.28), c.accent);
+    // A lighter inner arc suggests depth without a real gradient, which egui
+    // cannot fill directly.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(size, size * 0.5)),
+        egui::Rounding {
+            nw: size * 0.28,
+            ne: size * 0.28,
+            sw: 0.0,
+            se: 0.0,
+        },
+        c.accent.gamma_multiply(1.25),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "K",
+        egui::FontId::proportional(size * 0.58),
+        c.on_accent,
+    );
+}
+
+/// A coloured initial for an entry.
+///
+/// A list of forty identical rows is read line by line; a list with a colour
+/// and a letter per row is scanned. The colour comes from the name, so it is
+/// stable — the same entry looks the same every time, which is what makes it
+/// recognisable rather than decorative.
+///
+/// Hue only: saturation and lightness are fixed so no entry can come out
+/// unreadable against either theme.
+fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+
+    // FNV-1a: tiny, well-distributed, and stable across runs — unlike the
+    // standard hasher, which is randomly seeded per process and would give the
+    // same entry a different colour every launch.
+    let mut hash: u32 = 2_166_136_261;
+    for b in name.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    let hue = (hash % 360) as f32 / 360.0;
+    let fill = egui::ecolor::Hsva::new(hue, 0.55, if pal().bg.r() > 128 { 0.85 } else { 0.55 }, 1.0);
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(size * 0.3), egui::Color32::from(fill));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(size * 0.5),
+        egui::Color32::WHITE,
+    );
 }
 
 fn label(ui: &mut egui::Ui, text: &str) {
@@ -959,22 +1083,44 @@ impl eframe::App for App {
             // The detail pane holds a copy of the selected row rather than a
             // borrow, because drawing it mutates self (copy timestamps, panel
             // switches) and the borrow checker is right to refuse both at once.
-            if let Some(row) = self
+            // The detail pane is always there, even with nothing selected.
+            // Letting it appear and disappear made the list jump sideways on
+            // every click, which is disorienting in a way people feel without
+            // being able to name.
+            let selected = self
                 .open_entry
-                .and_then(|id| self.rows.iter().find(|r| r.id == id).cloned())
-            {
-                egui::SidePanel::right("details")
-                    .resizable(true)
-                    .default_width(330.0)
-                    .frame(
-                        egui::Frame::none()
-                            .fill(pal().bg)
-                            .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
-                    )
-                    .show(ctx, |ui| {
+                .and_then(|id| self.rows.iter().find(|r| r.id == id).cloned());
+            egui::SidePanel::right("details")
+                .resizable(true)
+                .default_width(340.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(pal().bg)
+                        .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
+                )
+                .show(ctx, |ui| match selected {
+                    Some(row) => {
                         egui::ScrollArea::vertical().show(ui, |ui| self.detail(ui, &row));
-                    });
-            }
+                    }
+                    None => {
+                        ui.add_space(ui.available_height() * 0.30);
+                        ui.vertical_centered(|ui| {
+                            logo(ui, 46.0);
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("Nothing selected")
+                                    .size(14.0)
+                                    .color(pal().text),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("Pick an entry to see it here")
+                                    .size(11.5)
+                                    .color(pal().muted),
+                            );
+                        });
+                    }
+                });
         }
 
         egui::CentralPanel::default()
@@ -982,6 +1128,8 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 if self.db.is_some() {
                     self.unlocked(ui);
+                } else if self.show_help_locked {
+                    self.help_view(ui);
                 } else if self.creating {
                     self.create_view(ui);
                 } else {
@@ -1152,9 +1300,22 @@ impl App {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("VALU").size(26.0).strong().color(pal().text));
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new("password vault").size(12.0).color(pal().muted));
+            logo(ui, 32.0);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.add_space(1.0);
+                ui.label(
+                    egui::RichText::new("Keypal")
+                        .size(21.0)
+                        .strong()
+                        .color(pal().text),
+                );
+                ui.label(
+                    egui::RichText::new("password vault  ·  by R.K.")
+                        .size(10.5)
+                        .color(pal().muted),
+                );
+            });
             if self.db.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Lock").clicked() {
@@ -1170,7 +1331,23 @@ impl App {
     }
 
     fn locked(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
+        // The first screen anyone sees. It was a grey form on a grey field;
+        // now it carries the mark and one line saying what this is, because a
+        // lock screen with no identity reads as an error dialog.
+        ui.add_space(ui.available_height() * 0.05);
+        ui.vertical_centered(|ui| {
+            logo(ui, 56.0);
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Keypal").size(28.0).strong().color(pal().text));
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Your passwords, kept on this machine and nowhere else")
+                    .size(12.5)
+                    .color(pal().muted),
+            );
+        });
+        ui.add_space(20.0);
+        form(ui, |ui| {
             label(ui, "YOUR VAULTS");
             ui.add_space(4.0);
             if self.vaults.is_empty() {
@@ -1241,6 +1418,12 @@ impl App {
                     self.creating = true;
                     self.set("", Level::None);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("What is this?").clicked() {
+                        self.panel = Panel::Help;
+                        self.show_help_locked = true;
+                    }
+                });
             });
         });
     }
@@ -1298,6 +1481,7 @@ impl App {
             Panel::History(id) => return self.history_view(ui, id),
             Panel::Trash => return self.trash_view(ui),
             Panel::Settings => return self.settings_view(ui),
+            Panel::Help => return self.help_view(ui),
             Panel::List => {}
         }
 
@@ -1339,6 +1523,10 @@ impl App {
                 }
                 if ui.button("Change passphrase…").clicked() {
                     self.panel = Panel::ChangePass;
+                    ui.close_menu();
+                }
+                if ui.button("How this protects you…").clicked() {
+                    self.panel = Panel::Help;
                     ui.close_menu();
                 }
                 if ui.button("Settings…").clicked() {
@@ -1399,9 +1587,37 @@ impl App {
         let total = self.rows.len();
         card(ui, |ui| {
             if total == 0 {
-                ui.label(
-                    egui::RichText::new("This vault is empty. Add an entry to begin.").color(pal().muted),
-                );
+                ui.add_space(28.0);
+                ui.vertical_centered(|ui| {
+                    logo(ui, 54.0);
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new("Your vault is empty")
+                            .size(17.0)
+                            .strong()
+                            .color(pal().text),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Add your first password, or bring the ones you already have.",
+                        )
+                        .size(12.5)
+                        .color(pal().muted),
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() / 2.0 - 130.0);
+                        if primary(ui, "Add an entry") {
+                            self.draft = Draft::default();
+                            self.panel = Panel::Editor;
+                        }
+                        if ui.button("Import…").clicked() {
+                            self.panel = Panel::ImportCsv;
+                        }
+                    });
+                    ui.add_space(24.0);
+                });
                 return;
             }
             if shown.is_empty() {
@@ -1411,31 +1627,59 @@ impl App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let last = shown.len().saturating_sub(1);
                 for (i, row) in shown.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&row.name).size(14.0).strong());
-                            let mut sub = row.username.clone();
-                            if row.totp.is_some() {
-                                if !sub.is_empty() {
-                                    sub.push_str("   ");
-                                }
-                                sub.push_str("• 2FA");
+                    let selected = self.open_entry == Some(row.id);
+                    // The whole row is the target. A dedicated Open button asks
+                    // the user to aim at 60 pixels when 700 were available.
+                    let resp = ui
+                        .scope(|ui| {
+                            if selected {
+                                ui.painter().rect_filled(
+                                    ui.available_rect_before_wrap()
+                                        .expand2(egui::vec2(6.0, 3.0)),
+                                    egui::Rounding::same(8.0),
+                                    pal().accent.linear_multiply(0.18),
+                                );
                             }
-                            if !sub.trim().is_empty() {
-                                ui.label(egui::RichText::new(sub).size(11.0).color(pal().muted));
-                            }
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Open").clicked() {
-                                self.open_entry = Some(row.id);
-                                self.reveal_password = false;
-                                self.reveal_notes = false;
-                            }
-                        });
-                    });
+                            ui.horizontal(|ui| {
+                                avatar(ui, &row.name, 30.0);
+                                ui.add_space(4.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&row.name)
+                                            .size(14.0)
+                                            .strong()
+                                            .color(if selected { pal().accent } else { pal().text }),
+                                    );
+                                    let mut sub = row.username.clone();
+                                    if row.totp.is_some() {
+                                        if !sub.is_empty() {
+                                            sub.push_str("   ");
+                                        }
+                                        sub.push_str("2FA");
+                                    }
+                                    if !sub.trim().is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(sub)
+                                                .size(11.0)
+                                                .color(pal().muted),
+                                        );
+                                    }
+                                });
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        self.open_entry = Some(row.id);
+                        self.reveal_password = false;
+                        self.reveal_notes = false;
+                    }
                     if i != last {
-                        ui.add_space(2.0);
-                        ui.separator();
+                        ui.add_space(3.0);
                     }
                 }
             });
@@ -1448,8 +1692,12 @@ impl App {
             // Name on its own line. Sharing a row with four buttons meant the
             // name was the thing that got clipped — the one label that tells
             // you which entry you are looking at.
-            ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                avatar(ui, &row.name, 34.0);
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
+            });
+            ui.add_space(8.0);
             // Reading order, not reverse: Edit is the common action and comes
             // first; Close last, where a dismiss belongs.
             ui.horizontal_wrapped(|ui| {
@@ -1980,7 +2228,7 @@ impl App {
                 .color(pal().danger),
             );
             ui.add_space(6.0);
-            field(ui, &mut self.export_path, "/home/you/valu-export.csv", false);
+            field(ui, &mut self.export_path, "/home/you/keypal-export.csv", false);
             ui.add_space(8.0);
             if ui
                 .add_sized(
@@ -2105,6 +2353,123 @@ impl App {
                     self.change_new.clear();
                     self.change_again.clear();
                     self.panel = Panel::List;
+                }
+            });
+        });
+    }
+
+    fn help_view(&mut self, ui: &mut egui::Ui) {
+        // Written as prose the user can check against the code, not as
+        // marketing. Every claim here is one the tests enforce; the limits
+        // section exists because a security page that lists only strengths is
+        // an advertisement.
+        form(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                let h = |ui: &mut egui::Ui, t: &str| {
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(t).size(14.0).strong().color(pal().accent));
+                    ui.add_space(4.0);
+                };
+                let para = |ui: &mut egui::Ui, t: &str| {
+                    ui.label(egui::RichText::new(t).size(13.0).color(pal().text));
+                    ui.add_space(6.0);
+                };
+
+                ui.label(egui::RichText::new("How this protects you").size(19.0).strong());
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Written to be checked, not believed.")
+                        .size(12.0)
+                        .color(pal().muted),
+                );
+
+                h(ui, "What it is");
+                para(ui, "A password vault that keeps everything on this machine. \
+                          There is no account, no server, no sync, and nothing is sent \
+                          anywhere — including to us.");
+
+                h(ui, "How your passwords are protected");
+                para(ui, "Your passphrase is put through Argon2id, the winner of the \
+                          Password Hashing Competition, tuned to the profile RFC 9106 \
+                          recommends for interactive use: three passes over 64 MiB of \
+                          memory. The memory cost is the point — it makes guessing \
+                          expensive on graphics cards, which is how passphrases are \
+                          actually attacked.");
+                para(ui, "The result never encrypts anything directly. It is split by \
+                          HKDF into separate keys for encryption, authentication and \
+                          erasure, so no single key does two jobs.");
+                para(ui, "Entries are encrypted with AES-256-GCM. Every field gets its \
+                          own nonce, and editing an entry generates fresh ones. That \
+                          detail matters more than it sounds: reusing a nonce would let \
+                          anyone holding the file recover the difference between two \
+                          values without ever knowing the key.");
+
+                h(ui, "What is on disk, and what is not");
+                para(ui, "The vault is one SQLite file. Names, usernames, passwords, \
+                          URLs, notes, tags and two-factor secrets are all ciphertext — \
+                          the name of an entry is as protected as its password, so the \
+                          file does not reveal which accounts you hold.");
+                para(ui, "Not encrypted, because they cannot be: the Argon2 salt, which \
+                          is not secret by design, and the access log's entry ids and \
+                          timestamps. The log deliberately stores no names — a list of \
+                          names beside the ciphertext would undo the encryption for \
+                          anyone who read the file.");
+
+                h(ui, "Deleting really deletes");
+                para(ui, "Deleting moves an entry to the trash, which is reversible. \
+                          Destroying it is not, and it does more than a database DELETE \
+                          would: SQLite hands the page back to its free list without \
+                          touching the bytes, so the old ciphertext survives in the file. \
+                          Instead the row and every stored version of its password are \
+                          overwritten with random data encrypted under a separate wipe \
+                          key, which forces the page to be rewritten. That key exists \
+                          only while the vault is open, and is wiped from memory when \
+                          you lock it.");
+
+                h(ui, "While it is running");
+                para(ui, "Key material is locked into RAM so the system cannot page it \
+                          to swap, and overwritten when the vault locks. The interface \
+                          is compiled into the same program as the vault, so a revealed \
+                          password never crosses a boundary into memory we do not \
+                          control — which is why this is not built on a web view.");
+                para(ui, "Rust is used for the same reason: whole classes of bug that \
+                          leak memory contents in C — buffer overruns, use-after-free — \
+                          are rejected before the program is built. It is also fast, but \
+                          that is a side benefit, not the reason.");
+
+                h(ui, "Where the protection stops");
+                para(ui, "Copying to the clipboard puts a password somewhere every \
+                          application can read. It is overwritten after twenty seconds, \
+                          which is a limit, not a fix.");
+                para(ui, "During key derivation Argon2 needs 64 MiB that cannot be \
+                          locked under the default system limit, so it may be paged. \
+                          Raising the limit closes that gap.");
+                para(ui, "Importing from KeePass decrypts through another library, whose \
+                          buffers are not ours to wipe. Secrets served over D-Bus leave \
+                          our control at the bus.");
+                para(ui, "And nothing here defends a machine that is already \
+                          compromised. A keylogger sees your passphrase as you type it, \
+                          whatever the vault does afterwards.");
+
+                h(ui, "The program is not obfuscated, on purpose");
+                para(ui, "Security here does not rest on the code being secret. Your key \
+                          comes from your passphrase; someone who reads every line gains \
+                          nothing. An encrypted binary has to decrypt itself to run, so \
+                          it carries its own key — a lock with the key taped to it — \
+                          while blocking the independent review that would find real \
+                          flaws. AES is public for the same reason.");
+
+                h(ui, "Carrying it on a USB stick");
+                para(ui, "Put an empty file named .keypal-portable beside the program and \
+                          it reads and writes only on that medium, touching nothing on \
+                          the host. Your vault travels with you and the borrowed machine \
+                          keeps no trace — though it can still keep the clipboard, and \
+                          swap is out of our hands there too.");
+
+                ui.add_space(14.0);
+                if ui.button("Close").clicked() {
+                    self.panel = Panel::List;
+                    self.show_help_locked = false;
                 }
             });
         });
@@ -2309,11 +2674,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([660.0, 740.0])
             .with_min_inner_size([480.0, 540.0])
-            .with_title("VALU"),
+            .with_title("Keypal"),
         ..Default::default()
     };
     eframe::run_native(
-        "VALU",
+        "Keypal",
         options,
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx, false);
