@@ -325,3 +325,108 @@ mod tests {
         assert_eq!(rows[0].password, "pw");
     }
 }
+
+// ── Text files ───────────────────────────────────────────────────────────────
+
+/// Largest text file accepted into a single entry.
+///
+/// One megabyte, and the limit is deliberate rather than arbitrary. SQLite
+/// materialises a BLOB entirely in memory on every read, and every field of an
+/// entry is decrypted together — so a 20 MB note would make simply opening that
+/// entry slow, and the whole list slow with it. Above this size the honest
+/// answer is an encrypted volume, not a database row.
+pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, PartialEq)]
+pub enum TextError {
+    TooBig { bytes: usize },
+    NotText,
+    Unreadable,
+}
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TextError::TooBig { bytes } => write!(
+                f,
+                "that file is {} KB — the limit for a note is {} KB; use an encrypted volume for anything larger",
+                bytes / 1024,
+                MAX_TEXT_BYTES / 1024
+            ),
+            TextError::NotText => write!(f, "that does not look like a text file"),
+            TextError::Unreadable => write!(f, "cannot read that file"),
+        }
+    }
+}
+
+/// Read a text file destined for an entry's notes.
+///
+/// Refuses binary rather than storing mojibake: a PDF read as text becomes
+/// replacement characters, and the user would only find out when they needed
+/// the contents back. NUL bytes are the giveaway — no text file contains them,
+/// every binary format does.
+pub fn read_text_file(path: &std::path::Path) -> Result<String, TextError> {
+    let meta = std::fs::metadata(path).map_err(|_| TextError::Unreadable)?;
+    // Checked before reading, so a huge file is never pulled into memory just
+    // to be rejected.
+    if meta.len() as usize > MAX_TEXT_BYTES {
+        return Err(TextError::TooBig { bytes: meta.len() as usize });
+    }
+    let bytes = std::fs::read(path).map_err(|_| TextError::Unreadable)?;
+    if bytes.contains(&0) {
+        return Err(TextError::NotText);
+    }
+    String::from_utf8(bytes).map_err(|_| TextError::NotText)
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("keypal-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn reads_a_text_file() {
+        let p = tmp("note.txt", b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n");
+        let text = read_text_file(&p).unwrap();
+        assert!(text.starts_with("-----BEGIN"));
+    }
+
+    #[test]
+    fn refuses_binary_rather_than_storing_mojibake() {
+        // A PDF read as text becomes replacement characters, and the user finds
+        // out only when they need the contents back.
+        let p = tmp("doc.pdf", b"%PDF-1.7\n\x00\x01\x02binary");
+        assert_eq!(read_text_file(&p), Err(TextError::NotText));
+    }
+
+    #[test]
+    fn refuses_anything_over_the_limit_without_reading_it() {
+        let p = tmp("big.txt", &vec![b'a'; MAX_TEXT_BYTES + 1]);
+        match read_text_file(&p) {
+            Err(TextError::TooBig { bytes }) => assert!(bytes > MAX_TEXT_BYTES),
+            other => panic!("expected TooBig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_limit_is_accepted() {
+        // Off-by-one at a boundary is how a documented limit becomes a lie.
+        let p = tmp("exact.txt", &vec![b'a'; MAX_TEXT_BYTES]);
+        assert_eq!(read_text_file(&p).unwrap().len(), MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_as_unreadable() {
+        assert_eq!(
+            read_text_file(std::path::Path::new("/nonexistent/keypal/x.txt")),
+            Err(TextError::Unreadable)
+        );
+    }
+}

@@ -181,6 +181,8 @@ struct App {
     reveal_notes: bool,
     focus_search: bool,
     show_help_locked: bool,
+    loading_text: bool,
+    text_path: String,
     shot_requested: bool,
     shot_countdown: u32,
     draft: Draft,
@@ -228,6 +230,8 @@ impl Default for App {
             reveal_notes: false,
             focus_search: false,
             show_help_locked: false,
+            loading_text: false,
+            text_path: String::new(),
             shot_requested: false,
             shot_countdown: 8,
             draft: Draft::default(),
@@ -2251,7 +2255,54 @@ impl App {
             self.draft.tags = tg;
 
             ui.add_space(8.0);
-            label(ui, "NOTES (optional)");
+            ui.horizontal(|ui| {
+                label(ui, "NOTES (optional)");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Load a text file…").clicked() {
+                        self.loading_text = !self.loading_text;
+                    }
+                });
+            });
+            if self.loading_text {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.text_path)
+                            .hint_text("/home/you/key.txt")
+                            .desired_width(ui.available_width() - 90.0)
+                            .margin(egui::Margin::symmetric(10.0, 7.0)),
+                    );
+                    if ui.button("Load").clicked() {
+                        let path = self.text_path.trim().to_string();
+                        match valu::import::read_text_file(std::path::Path::new(&path)) {
+                            Ok(text) => {
+                                // Appended, never overwritten: silently
+                                // replacing whatever the user had already typed
+                                // is not a load, it is a loss.
+                                if !self.draft.notes.is_empty() {
+                                    self.draft.notes.push_str("\n\n");
+                                }
+                                self.draft.notes.push_str(&text);
+                                let kb = text.len() / 1024;
+                                self.set(format!("Loaded {kb} KB into notes"), Level::Ok);
+                                self.loading_text = false;
+                                self.text_path.clear();
+                            }
+                            Err(e) => self.set(e.to_string(), Level::Bad),
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Any text file up to 1 MB — an SSH key, an API token, a recovery \
+                         sheet. It is encrypted with the rest of the entry. For anything \
+                         larger, or for binary files, use an encrypted volume and keep \
+                         its passphrase here.",
+                    )
+                    .size(11.0)
+                    .color(pal().muted),
+                );
+                ui.add_space(4.0);
+            }
             let mut nt = self.draft.notes.clone();
             ui.add(
                 egui::TextEdit::multiline(&mut nt)
