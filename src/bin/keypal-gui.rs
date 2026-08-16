@@ -181,6 +181,8 @@ struct App {
     reveal_notes: bool,
     focus_search: bool,
     show_help_locked: bool,
+    shot_requested: bool,
+    shot_countdown: u32,
     draft: Draft,
     import_path: String,
     import_pass: String,
@@ -226,6 +228,8 @@ impl Default for App {
             reveal_notes: false,
             focus_search: false,
             show_help_locked: false,
+            shot_requested: false,
+            shot_countdown: 8,
             draft: Draft::default(),
             import_path: String::new(),
             import_pass: String::new(),
@@ -819,6 +823,30 @@ impl App {
 
 // ── Styling ─────────────────────────────────────────────────────────────────
 
+/// Install the bundled monospace face.
+///
+/// Compiled into the binary with `include_bytes!`, so there is no file to
+/// find, nothing to load at runtime and nothing an attacker can substitute by
+/// editing the directory. egui already parses TTF for its default faces, so
+/// this uses machinery that is present either way.
+///
+/// It matters for a vault specifically: passwords and one-time codes are read
+/// character by character, and a proportional face makes 0/O and 1/l/I
+/// ambiguous exactly where a misread costs you a login.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "keypal-mono".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/mono.ttf")),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "keypal-mono".to_owned());
+    ctx.set_fonts(fonts);
+}
+
 fn apply_theme(ctx: &egui::Context, light: bool) {
     set_palette(light);
     let c = pal();
@@ -863,9 +891,17 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
 fn form<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     const MEASURE: f32 = 560.0;
     let width = ui.available_width().min(MEASURE);
-    ui.vertical(|ui| {
-        ui.set_max_width(width);
-        card(ui, add)
+    // Centred, not merely narrowed. Capping the width alone left the card
+    // pinned to the left edge with a third of the window empty beside it,
+    // which looks like a layout that ran out rather than one that was chosen.
+    let pad = ((ui.available_width() - width) / 2.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        ui.vertical(|ui| {
+            ui.set_max_width(width);
+            card(ui, add)
+        })
+        .inner
     })
     .inner
 }
@@ -919,6 +955,201 @@ fn logo(ui: &mut egui::Ui, size: f32) {
         egui::FontId::proportional(size * 0.58),
         c.on_accent,
     );
+}
+
+/// Icons drawn as shapes, not loaded as images.
+///
+/// Deliberate: an image file needs a decoder running over data at startup, and
+/// a vault should not grow parsing surface for decoration. Drawn icons cost
+/// nothing to parse, cannot be swapped by someone editing files beside the
+/// binary, take the theme colour for free, and stay crisp at any size or
+/// display scale.
+#[derive(Clone, Copy, PartialEq)]
+enum Icon {
+    Key,
+    Shield,
+    Eye,
+    EyeOff,
+    Copy,
+    Edit,
+    Trash,
+    Plus,
+    Search,
+    Import,
+    Export,
+    Lock,
+    Clock,
+    Tag,
+    Settings,
+    Help,
+    Close,
+}
+
+/// Draw `icon` into a square of `size`, in `color`.
+fn icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    let u = size / 24.0; // the shapes below are described on a 24-unit grid
+    let w = 1.7 * u;
+    let stroke = egui::Stroke::new(w, color);
+    let at = |x: f32, y: f32| egui::pos2(c.x + (x - 12.0) * u, c.y + (y - 12.0) * u);
+    let line = |p: &egui::Painter, a: (f32, f32), b: (f32, f32)| {
+        p.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
+    };
+
+    match icon {
+        Icon::Key => {
+            p.circle_stroke(at(8.5, 8.5), 4.0 * u, stroke);
+            line(p, (11.5, 11.5), (19.0, 19.0));
+            line(p, (16.0, 16.0), (18.0, 14.0));
+        }
+        Icon::Shield => {
+            let pts = vec![at(12.0, 3.0), at(20.0, 6.5), at(20.0, 12.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(20.0, 12.0), at(12.0, 21.0), at(4.0, 12.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(4.0, 12.0), at(4.0, 6.5), at(12.0, 3.0)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Eye | Icon::EyeOff => {
+            let pts = vec![at(3.0, 12.0), at(8.0, 6.5), at(16.0, 6.5), at(21.0, 12.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(21.0, 12.0), at(16.0, 17.5), at(8.0, 17.5), at(3.0, 12.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            p.circle_stroke(at(12.0, 12.0), 2.6 * u, stroke);
+            if icon == Icon::EyeOff {
+                line(p, (4.0, 20.0), (20.0, 4.0));
+            }
+        }
+        Icon::Copy => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(9.0, 3.0), at(21.0, 15.0)),
+                egui::Rounding::same(2.0 * u),
+                stroke,
+            );
+            let pts = vec![at(15.0, 18.0), at(3.0, 18.0), at(3.0, 6.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            line(p, (3.0, 18.0), (15.0, 18.0));
+            line(p, (15.0, 18.0), (15.0, 15.0));
+        }
+        Icon::Edit => {
+            let pts = vec![at(4.0, 20.0), at(4.0, 15.0), at(16.0, 3.0), at(21.0, 8.0), at(9.0, 20.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            line(p, (4.0, 20.0), (9.0, 20.0));
+        }
+        Icon::Trash => {
+            line(p, (3.5, 6.0), (20.5, 6.0));
+            line(p, (9.0, 6.0), (9.0, 3.5));
+            line(p, (9.0, 3.5), (15.0, 3.5));
+            line(p, (15.0, 3.5), (15.0, 6.0));
+            let pts = vec![at(5.5, 6.0), at(6.5, 20.5), at(17.5, 20.5), at(18.5, 6.0)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Plus => {
+            line(p, (12.0, 5.0), (12.0, 19.0));
+            line(p, (5.0, 12.0), (19.0, 12.0));
+        }
+        Icon::Search => {
+            p.circle_stroke(at(10.5, 10.5), 6.0 * u, stroke);
+            line(p, (15.0, 15.0), (20.0, 20.0));
+        }
+        Icon::Import | Icon::Export => {
+            let pts = vec![at(4.0, 15.0), at(4.0, 20.0), at(20.0, 20.0), at(20.0, 15.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            if icon == Icon::Import {
+                line(p, (12.0, 3.0), (12.0, 15.0));
+                let pts = vec![at(7.5, 10.5), at(12.0, 15.0), at(16.5, 10.5)];
+                p.add(egui::Shape::line(pts, stroke));
+            } else {
+                line(p, (12.0, 15.0), (12.0, 3.0));
+                let pts = vec![at(7.5, 7.5), at(12.0, 3.0), at(16.5, 7.5)];
+                p.add(egui::Shape::line(pts, stroke));
+            }
+        }
+        Icon::Lock => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(4.5, 10.5), at(19.5, 20.5)),
+                egui::Rounding::same(2.0 * u),
+                stroke,
+            );
+            let pts = vec![at(8.0, 10.5), at(8.0, 7.0), at(12.0, 4.0), at(16.0, 7.0), at(16.0, 10.5)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Clock => {
+            p.circle_stroke(at(12.0, 12.0), 8.5 * u, stroke);
+            line(p, (12.0, 7.0), (12.0, 12.0));
+            line(p, (12.0, 12.0), (16.0, 14.0));
+        }
+        Icon::Tag => {
+            let pts = vec![at(3.5, 3.5), at(11.0, 3.5), at(20.5, 13.0), at(13.0, 20.5), at(3.5, 11.0), at(3.5, 3.5)];
+            p.add(egui::Shape::line(pts, stroke));
+            p.circle_filled(at(7.5, 7.5), 1.6 * u, color);
+        }
+        Icon::Settings => {
+            p.circle_stroke(at(12.0, 12.0), 3.4 * u, stroke);
+            for k in 0..6 {
+                let a = std::f32::consts::TAU * k as f32 / 6.0;
+                let (dx, dy) = (a.cos(), a.sin());
+                p.line_segment(
+                    [
+                        egui::pos2(c.x + dx * 6.0 * u, c.y + dy * 6.0 * u),
+                        egui::pos2(c.x + dx * 9.5 * u, c.y + dy * 9.5 * u),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Icon::Help => {
+            p.circle_stroke(at(12.0, 12.0), 8.5 * u, stroke);
+            let pts = vec![at(9.0, 9.5), at(12.0, 7.0), at(15.0, 9.5), at(12.0, 13.0), at(12.0, 14.5)];
+            p.add(egui::Shape::line(pts, stroke));
+            p.circle_filled(at(12.0, 18.0), 1.2 * u, color);
+        }
+        Icon::Close => {
+            line(p, (6.0, 6.0), (18.0, 18.0));
+            line(p, (18.0, 6.0), (6.0, 18.0));
+        }
+    }
+}
+
+/// A button with an icon and a label, which is what a toolbar should be.
+fn icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str) -> bool {
+    // Same pill as every other button. The first version drew the icon and
+    // label bare, so these read as floating text next to real buttons — one
+    // toolbar with two different ideas of what a button looks like.
+    let id = ui.next_auto_id();
+    ui.skip_ahead_auto_ids(1);
+    let painter = ui.painter().clone();
+    let bg = painter.add(egui::Shape::Noop);
+
+    let inner = ui
+        .scope(|ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(9.0);
+                icon(ui, glyph, 14.0, pal().text);
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new(text).size(13.0));
+                ui.add_space(9.0);
+            });
+        })
+        .response;
+
+    let rect = inner.rect.expand2(egui::vec2(0.0, 5.0));
+    let click = ui.interact(rect, id, egui::Sense::click());
+    let fill = if click.hovered() {
+        pal().accent.linear_multiply(0.45)
+    } else {
+        pal().surface_hi
+    };
+    painter.set(
+        bg,
+        egui::Shape::rect_filled(rect, egui::Rounding::same(9.0), fill),
+    );
+    if click.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    click.clicked()
 }
 
 /// A coloured initial for an entry.
@@ -1027,6 +1258,83 @@ impl eframe::App for App {
             self.lock("Locked on minimise");
         }
 
+        // ── Design feedback loop ────────────────────────────────────────────
+        //
+        // KEYPAL_SHOT=<path> makes the window photograph itself: F12 (or the
+        // env var alone, on the first frames) asks egui for the framebuffer and
+        // writes a PNG. Wayland refuses X11 screen capture, so without this the
+        // only way to see the interface is to ask the user for a screenshot —
+        // which makes every visual change a round trip through another person.
+        //
+        // Debug affordance, not a feature: it is off unless the variable is
+        // set, and it captures nothing a person looking at the screen cannot
+        // already see. It is still worth being deliberate about — a vault that
+        // can silently write images of its own unlocked contents would be a
+        // poor vault, which is why there is no default path and no UI for it.
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            self.shot_requested = true;
+        }
+        if self.shot_requested {
+            self.shot_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        }
+        if let Some(path) = std::env::var("KEYPAL_SHOT").ok().filter(|p| !p.is_empty()) {
+            // Optionally open a vault first, so the screens behind the lock can
+            // be photographed too. Only ever reached with KEYPAL_SHOT set.
+            if self.shot_countdown == 8 {
+                if let (Ok(v), Ok(pw)) =
+                    (std::env::var("KEYPAL_SHOT_VAULT"), std::env::var("KEYPAL_SHOT_PASS"))
+                {
+                    self.manual_path = v;
+                    self.passphrase = pw;
+                    self.unlock();
+                    if let Ok(panel) = std::env::var("KEYPAL_SHOT_PANEL") {
+                        self.panel = match panel.as_str() {
+                            "editor" => Panel::Editor,
+                            "import" => Panel::ImportCsv,
+                            "export" => Panel::Export,
+                            "settings" => Panel::Settings,
+                            "help" => Panel::Help,
+                            "trash" => Panel::Trash,
+                            _ => Panel::List,
+                        };
+                        if panel == "detail" {
+                            self.open_entry = self.rows.first().map(|r| r.id);
+                        }
+                    }
+                }
+            }
+            self.shot_countdown = self.shot_countdown.saturating_sub(1);
+            if self.shot_countdown == 1 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            }
+            let image = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = image {
+                let [w, h] = image.size;
+                let mut png = Vec::new();
+                {
+                    let mut enc = png::Encoder::new(&mut png, w as u32, h as u32);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    if let Ok(mut writer) = enc.write_header() {
+                        let bytes: Vec<u8> = image
+                            .pixels
+                            .iter()
+                            .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
+                            .collect();
+                        let _ = writer.write_image_data(&bytes);
+                    }
+                }
+                let _ = std::fs::write(&path, png);
+                std::process::exit(0);
+            }
+        }
+
         // Keyboard first: a password manager is used dozens of times a day, and
         // reaching for the mouse each time is what makes people stop using one.
         if self.db.is_some() {
@@ -1065,18 +1373,31 @@ impl eframe::App for App {
         // others into it would put an empty sidebar next to a password prompt.
         let browsing = self.db.is_some() && self.panel == Panel::List;
 
-        egui::TopBottomPanel::top("head")
-            .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(20.0, 14.0)))
-            .show(ctx, |ui| self.header(ui));
+        // No title bar on the lock screen: the hero below already carries the
+        // mark and the name, and showing both put the same two lines twice
+        // within eighty pixels of each other.
+        if self.db.is_some() || self.creating || self.show_help_locked {
+            egui::TopBottomPanel::top("head")
+                .frame(
+                    egui::Frame::none()
+                        .fill(pal().bg)
+                        .inner_margin(egui::Margin::symmetric(20.0, 14.0)),
+                )
+                .show(ctx, |ui| self.header(ui));
+        }
 
+        // Nothing to report while locked, and an empty grey band at the foot of
+        // the first screen reads as a rendering fault.
+        if self.db.is_some() || !self.status.is_empty() {
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::none().fill(pal().surface).inner_margin(egui::Margin::symmetric(20.0, 8.0)))
             .show(ctx, |ui| self.status_bar(ui));
+        }
 
         if browsing {
             egui::SidePanel::left("nav")
                 .resizable(true)
-                .default_width(210.0)
+                .default_width(190.0)
                 .frame(egui::Frame::none().fill(pal().bg).inner_margin(egui::Margin::symmetric(16.0, 14.0)))
                 .show(ctx, |ui| self.sidebar(ui));
 
@@ -1092,7 +1413,7 @@ impl eframe::App for App {
                 .and_then(|id| self.rows.iter().find(|r| r.id == id).cloned());
             egui::SidePanel::right("details")
                 .resizable(true)
-                .default_width(340.0)
+                .default_width(310.0)
                 .frame(
                     egui::Frame::none()
                         .fill(pal().bg)
@@ -1277,10 +1598,15 @@ impl App {
         let report = self.security_report();
         let sc = report.score;
         let color = if sc >= 85 { pal().ok } else if sc >= 60 { pal().warn } else { pal().danger };
-        ui.label(egui::RichText::new(format!("{sc}/100")).size(22.0).strong().color(color));
+        ui.label(egui::RichText::new(format!("{sc}")).size(30.0).strong().color(color));
+        ui.add_space(2.0);
+        // Slim: this is a status line, not the subject of the pane. At full
+        // height it was a block of colour that pulled the eye away from the
+        // list, which is what the window is actually for.
         ui.add(
             egui::ProgressBar::new(sc as f32 / 100.0)
                 .desired_width(150.0)
+                .desired_height(5.0)
                 .fill(color),
         );
         ui.add_space(6.0);
@@ -1318,7 +1644,7 @@ impl App {
             });
             if self.db.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Lock").clicked() {
+                    if icon_button(ui, Icon::Lock, "Lock") {
                         self.lock("Locked");
                     }
                     if ui.button("Passphrase…").clicked() {
@@ -1334,19 +1660,20 @@ impl App {
         // The first screen anyone sees. It was a grey form on a grey field;
         // now it carries the mark and one line saying what this is, because a
         // lock screen with no identity reads as an error dialog.
-        ui.add_space(ui.available_height() * 0.05);
+        ui.add_space(26.0);
         ui.vertical_centered(|ui| {
-            logo(ui, 56.0);
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Keypal").size(28.0).strong().color(pal().text));
-            ui.add_space(2.0);
+            logo(ui, 52.0);
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Keypal").size(26.0).strong().color(pal().text));
+            ui.add_space(3.0);
             ui.label(
                 egui::RichText::new("Your passwords, kept on this machine and nowhere else")
                     .size(12.5)
                     .color(pal().muted),
             );
         });
-        ui.add_space(20.0);
+        ui.add_space(18.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
         form(ui, |ui| {
             label(ui, "YOUR VAULTS");
             ui.add_space(4.0);
@@ -1426,6 +1753,7 @@ impl App {
                 });
             });
         });
+        });
     }
 
     fn create_view(&mut self, ui: &mut egui::Ui) {
@@ -1485,23 +1813,26 @@ impl App {
             Panel::List => {}
         }
 
-        ui.horizontal(|ui| {
+        // Wrapping, not clipping. At the widths the three panes leave, a fixed
+        // row silently cut "More" down to "Mor" — a button nobody can read is a
+        // button nobody presses.
+        ui.horizontal_wrapped(|ui| {
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Search…   ( / )")
-                    .desired_width(200.0)
+                    .desired_width(170.0)
                     .margin(egui::Margin::symmetric(10.0, 7.0)),
             );
             if self.focus_search {
                 search.request_focus();
                 self.focus_search = false;
             }
-            if ui.button("+ Add").clicked() {
+            if icon_button(ui, Icon::Plus, "Add") {
                 self.draft = Draft::default();
                 self.panel = Panel::Editor;
                 self.open_entry = None;
             }
-            ui.menu_button("Import ▾", |ui| {
+            ui.menu_button("Import  v", |ui| {
                 if ui.button("From a CSV export…").clicked() {
                     self.panel = Panel::ImportCsv;
                     ui.close_menu();
@@ -1511,7 +1842,7 @@ impl App {
                     ui.close_menu();
                 }
             });
-            ui.menu_button("More ▾", |ui| {
+            ui.menu_button("More  v", |ui| {
                 if ui.button("Export & backup…").clicked() {
                     self.panel = Panel::Export;
                     ui.close_menu();
@@ -1706,17 +2037,17 @@ impl App {
             // Reading order, not reverse: Edit is the common action and comes
             // first; Close last, where a dismiss belongs.
             ui.horizontal_wrapped(|ui| {
-                    if ui.button("Close").clicked() {
+                    if icon_button(ui, Icon::Close, "Close") {
                         self.open_entry = None;
                     }
-                    if ui.button(egui::RichText::new("Delete").color(pal().danger)).clicked() {
+                    if icon_button(ui, Icon::Trash, "Delete") {
                         self.panel = Panel::Confirm(row.id, row.name.clone());
                     }
-                    if ui.button("History").clicked() {
+                    if icon_button(ui, Icon::Clock, "History") {
                         self.load_history(row.id);
                         self.panel = Panel::History(row.id);
                     }
-                    if ui.button("Edit").clicked() {
+                    if icon_button(ui, Icon::Edit, "Edit") {
                         self.draft = Draft {
                             id: Some(row.id),
                             name: row.name.clone(),
@@ -2677,8 +3008,8 @@ impl App {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([660.0, 740.0])
-            .with_min_inner_size([480.0, 540.0])
+            .with_inner_size([980.0, 820.0])
+            .with_min_inner_size([620.0, 620.0])
             .with_title("Keypal"),
         ..Default::default()
     };
@@ -2686,6 +3017,7 @@ fn main() -> eframe::Result {
         "Keypal",
         options,
         Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, false);
             Ok(Box::new(App::default()))
         }),
