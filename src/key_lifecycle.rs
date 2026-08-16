@@ -91,6 +91,51 @@ impl MasterKey {
         Ok(Self { mode: KeyMode::Passphrase, raw })
     }
 
+    /// Derive from a passphrase AND a key file: something you know plus
+    /// something you have.
+    ///
+    /// The file's contents are hashed and folded into the KDF input rather than
+    /// used as the key directly, so a short or low-entropy file still cannot
+    /// weaken the result below what the passphrase alone provides — and a
+    /// 4 GB file costs the same as a 32-byte one.
+    ///
+    /// Folded BEFORE Argon2, not after: mixing it into the output afterwards
+    /// would leave the expensive work to be done on the passphrase alone, so an
+    /// attacker holding the key file (a stolen USB stick) would face exactly
+    /// the passphrase-only cost. This way the key file is inside the slow part.
+    ///
+    /// Losing the key file loses the vault. That is the point of a second
+    /// factor and it must be said out loud wherever this is offered.
+    pub fn create_with_keyfile(
+        pass: &str,
+        salt: &[u8],
+        keyfile_bytes: &[u8],
+    ) -> Result<Self, ValuError> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"valu/keyfile/v1");
+        hasher.update(keyfile_bytes);
+        let digest = hasher.finalize();
+
+        // Domain-separated concatenation: a passphrase of "abc" with a file
+        // hashing to "def" must not collide with a passphrase of "abcdef" and
+        // no file. The length prefix makes the boundary unambiguous.
+        let mut combined = Vec::with_capacity(pass.len() + 1 + digest.len());
+        combined.extend_from_slice(&(pass.len() as u32).to_le_bytes());
+        combined.extend_from_slice(pass.as_bytes());
+        combined.extend_from_slice(&digest);
+
+        let policy = ArgonPolicy::sota();
+        let raw_bytes = kdf::argon2id_32b(&combined, salt, policy);
+        combined.zeroize();
+        let raw_bytes = raw_bytes?;
+
+        let mut raw = SecureBuffer::new_zeroed(32);
+        raw.as_mut_bytes().copy_from_slice(&raw_bytes);
+        drop(raw_bytes);
+        Ok(Self { mode: KeyMode::Passphrase, raw })
+    }
+
     /// Re-derive from an existing salt — used at unlock time.
     pub fn unlock_passphrase(pass: &str, salt: &[u8]) -> Result<Self, ValuError> {
         Self::create_passphrase(pass, salt)
@@ -192,6 +237,53 @@ impl std::ops::Drop for KeySession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_key_file_changes_the_derived_key() {
+        let salt = [7u8; 16];
+        let plain = MasterKey::create_passphrase("hunter2", &salt).unwrap();
+        let with_file = MasterKey::create_with_keyfile("hunter2", &salt, b"secret file").unwrap();
+        assert_ne!(plain.enc_key(), with_file.enc_key());
+    }
+
+    #[test]
+    fn the_same_passphrase_and_file_always_give_the_same_key() {
+        // Otherwise the vault opens once and never again.
+        let salt = [3u8; 16];
+        let a = MasterKey::create_with_keyfile("pw", &salt, b"file-contents").unwrap();
+        let b = MasterKey::create_with_keyfile("pw", &salt, b"file-contents").unwrap();
+        assert_eq!(a.enc_key(), b.enc_key());
+    }
+
+    #[test]
+    fn a_wrong_key_file_fails_as_hard_as_a_wrong_passphrase() {
+        let salt = [5u8; 16];
+        let right = MasterKey::create_with_keyfile("pw", &salt, b"the real file").unwrap();
+        let wrong_file = MasterKey::create_with_keyfile("pw", &salt, b"a different file").unwrap();
+        let wrong_pass = MasterKey::create_with_keyfile("nope", &salt, b"the real file").unwrap();
+        assert_ne!(right.enc_key(), wrong_file.enc_key());
+        assert_ne!(right.enc_key(), wrong_pass.enc_key());
+    }
+
+    #[test]
+    fn the_passphrase_and_file_boundary_is_unambiguous() {
+        // Without a length prefix, ("abc", file X) and ("abcdef", file X) could
+        // collide by concatenation. The prefix makes that impossible.
+        let salt = [9u8; 16];
+        let a = MasterKey::create_with_keyfile("abc", &salt, b"X").unwrap();
+        let b = MasterKey::create_with_keyfile("abcdef", &salt, b"X").unwrap();
+        assert_ne!(a.enc_key(), b.enc_key());
+    }
+
+    #[test]
+    fn an_empty_key_file_is_still_a_distinct_second_factor() {
+        // Degenerate but legal: the file exists and hashes to something, so it
+        // must not silently behave like no key file at all.
+        let salt = [1u8; 16];
+        let none = MasterKey::create_passphrase("pw", &salt).unwrap();
+        let empty = MasterKey::create_with_keyfile("pw", &salt, b"").unwrap();
+        assert_ne!(none.enc_key(), empty.enc_key());
+    }
+
     use super::*;
 
     #[test]

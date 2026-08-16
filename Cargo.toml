@@ -47,6 +47,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 keepass = "0.13"
 zbus = "5"
+eframe = "0.29"
+hmac = "0.12"
+sha1 = "0.10"
+base32 = "0.5"
 
 [dev-dependencies]
 criterion = "0.5"

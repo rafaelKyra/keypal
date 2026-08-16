@@ -11,6 +11,10 @@
 
 pub mod circuit_breaker;
 pub mod dbus;
+pub mod totp;
+pub mod audit;
+pub mod import;
+pub mod export;
 pub mod crypto;
 pub mod key_lifecycle;
 pub mod redaction;
