@@ -14,7 +14,8 @@ use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use valu::key_lifecycle::{KeySession, MasterKey};
-use valu::storage::VaultDatabase;
+use valu::kind::{self, Kind};
+use valu::storage::{EntryDraft, VaultDatabase};
 use valu::totp;
 
 // ── Palette ─────────────────────────────────────────────────────────────────
@@ -142,6 +143,9 @@ struct Row {
     tags: Option<String>,
     notes: Option<String>,
     password: String,
+    kind: Kind,
+    /// Already decoded, so the list and the detail pane do not each re-parse it.
+    fields: Vec<(String, String)>,
 }
 
 /// The editor works on a copy, so cancelling changes nothing and saving is one
@@ -149,6 +153,7 @@ struct Row {
 #[derive(Default, Clone)]
 struct Draft {
     id: Option<i64>, // None = new entry
+    kind: Kind,
     name: String,
     username: String,
     password: String,
@@ -157,6 +162,34 @@ struct Draft {
     tags: String,
     notes: String,
     show_password: bool,
+    /// Every category field the user has typed, by key.
+    ///
+    /// Keyed rather than positional, and never pruned when the category
+    /// changes: someone who picks "Server", fills in the host, then realises it
+    /// is really a "Database" would otherwise lose the host on the way. The
+    /// save only writes the keys the chosen category actually declares, so the
+    /// stray ones cost nothing but do not vanish while the form is open.
+    fields: std::collections::HashMap<String, String>,
+    /// Which secret category fields are currently revealed, by key.
+    shown_fields: std::collections::HashSet<String>,
+}
+
+impl Draft {
+    /// The value for one category field, empty if never typed.
+    fn field(&self, key: &str) -> String {
+        self.fields.get(key).cloned().unwrap_or_default()
+    }
+
+    /// The fields the CHOSEN category declares, in declaration order, ready to
+    /// be encoded. Anything left over from a category the user tried and
+    /// abandoned is dropped here rather than written to disk.
+    fn declared_fields(&self) -> Vec<(String, String)> {
+        self.kind
+            .extra()
+            .iter()
+            .map(|f| (f.key.to_string(), self.field(f.key).trim().to_string()))
+            .collect()
+    }
 }
 
 struct App {
@@ -179,6 +212,11 @@ struct App {
     open_entry: Option<i64>,
     reveal_password: bool,
     reveal_notes: bool,
+    /// Which category fields the detail pane is currently showing in the clear.
+    /// Cleared whenever another entry is opened, and on lock.
+    revealed_fields: std::collections::HashSet<String>,
+    /// Filter the list to one category, from the sidebar.
+    kind_filter: Option<Kind>,
     focus_search: bool,
     show_help_locked: bool,
     loading_text: bool,
@@ -229,6 +267,8 @@ impl Default for App {
             open_entry: None,
             reveal_password: false,
             reveal_notes: false,
+            revealed_fields: Default::default(),
+            kind_filter: None,
             focus_search: false,
             show_help_locked: false,
             loading_text: false,
@@ -461,6 +501,12 @@ impl App {
                         tags: e.tags,
                         notes: e.notes.map(|n| n.expose().clone()),
                         password: e.password.expose().clone(),
+                        kind: e.kind,
+                        fields: e
+                            .fields
+                            .as_ref()
+                            .map(|f| kind::decode_fields(f.expose()))
+                            .unwrap_or_default(),
                     })
                     .collect();
             }
@@ -629,6 +675,8 @@ impl App {
         self.open_entry = None;
         self.reveal_password = false;
         self.reveal_notes = false;
+        self.revealed_fields.clear();
+        self.kind_filter = None;
         self.draft = Draft::default();
         self.filter.clear();
         self.import_path.clear();
@@ -645,12 +693,19 @@ impl App {
         if d.name.trim().is_empty() {
             return self.set("Give the entry a name", Level::Bad);
         }
-        if d.password.is_empty() {
-            return self.set("Give the entry a password", Level::Bad);
+        // Only where the category has one. Demanding a password from a secure
+        // note or a set of recovery codes would be the password-manager
+        // assumption reasserting itself in the one place it does most harm:
+        // refusing to save the user's data.
+        match d.kind.secret_label() {
+            Some(what) if d.password.is_empty() => {
+                return self.set(format!("Give the entry a {}", what.to_lowercase()), Level::Bad);
+            }
+            _ => {}
         }
         // Validate the TOTP secret now rather than letting a typo surface as a
         // wrong code weeks later.
-        let totp_clean = if d.totp.trim().is_empty() {
+        let totp_clean = if !d.kind.uses_totp() || d.totp.trim().is_empty() {
             None
         } else {
             match totp::normalize_secret(&d.totp) {
@@ -658,22 +713,31 @@ impl App {
                 None => return self.set("That is not a valid two-factor secret", Level::Bad),
             }
         };
-        let uri = if d.uri.trim().is_empty() { None } else { Some(d.uri.trim().to_string()) };
+        // A category with nowhere to show a field must not keep a value in it:
+        // an invisible URL that still counted towards the health report would
+        // be a finding about something the user cannot see or fix.
+        let uri = Some(d.uri.trim())
+            .filter(|u| !u.is_empty() && d.kind.uri_label().is_some())
+            .map(str::to_string);
+        let username = if d.kind.username_label().is_some() { d.username.trim() } else { "" };
+        let fields = kind::encode_fields(&d.declared_fields());
+
+        let entry = EntryDraft {
+            name: d.name.trim(),
+            username,
+            password: &d.password,
+            uri: uri.as_deref(),
+            totp_secret: totp_clean.as_deref(),
+            notes: Some(d.notes.trim()),
+            tags: Some(d.tags.trim()),
+            kind: d.kind,
+            fields: Some(&fields),
+        };
 
         let done = match (self.db.as_ref(), self.session.as_ref()) {
             (Some(db), Some(session)) => match d.id {
-                Some(id) => db
-                    .update_entry_full(session, id, d.name.trim(), d.username.trim(),
-                                       &d.password, uri.as_deref(), totp_clean.as_deref(),
-                                       Some(d.notes.trim()), Some(d.tags.trim()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                None => db
-                    .insert_entry_full(session, d.name.trim(), d.username.trim(),
-                                       &d.password, uri.as_deref(), totp_clean.as_deref(),
-                                       Some(d.notes.trim()), Some(d.tags.trim()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
+                Some(id) => db.update_draft(session, id, &entry).map(|_| ()).map_err(|e| e.to_string()),
+                None => db.insert_draft(session, &entry).map(|_| ()).map_err(|e| e.to_string()),
             },
             _ => Err("vault is locked".into()),
         };
@@ -860,7 +924,18 @@ fn apply_theme(ctx: &egui::Context, light: bool) {
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = c.bg;
     v.window_fill = c.bg;
-    v.extreme_bg_color = egui::Color32::from_rgb(0x0d, 0x0f, 0x13);
+    // The inside of a text field. Hardcoded near-black until now, which left
+    // every search box and every input a dark slab on the light theme — the
+    // exact failure the palette comment at the top of this file warns about.
+    // A shade off the card it sits on, in the same direction the dark theme
+    // goes: there the field is darker than its surface, so here it is slightly
+    // darker than white. Pure white would match the card exactly and leave the
+    // field with no edge at all.
+    v.extreme_bg_color = if light {
+        egui::Color32::from_rgb(0xef, 0xf1, 0xf6)
+    } else {
+        egui::Color32::from_rgb(0x0d, 0x0f, 0x13)
+    };
     v.override_text_color = Some(c.text);
     v.selection.bg_fill = c.accent.linear_multiply(0.35);
     v.hyperlink_color = c.accent;
@@ -1064,6 +1139,89 @@ enum Icon {
     Settings,
     Help,
     Close,
+
+    // ── One per category ─────────────────────────────────────────────────
+    // A category the user cannot recognise at a glance is a category they
+    // will not bother choosing, and the whole idea collapses back into one
+    // undifferentiated list. So each gets a shape, not a colour swatch: shape
+    // survives greyscale, small sizes and colour-blindness, all three of which
+    // a colour alone does not.
+    Globe,
+    Envelope,
+    ShieldClock,
+    Bolt,
+    Terminal,
+    Stack,
+    Cylinder,
+    Wave,
+    Monitor,
+    Tunnel,
+    Rosette,
+    ListLines,
+    Coin,
+    Card,
+    Sheet,
+    Seal,
+}
+
+/// The shape that stands for a category.
+fn kind_icon(k: Kind) -> Icon {
+    match k {
+        Kind::Website => Icon::Globe,
+        Kind::Email => Icon::Envelope,
+        Kind::Authenticator => Icon::ShieldClock,
+        Kind::ApiKey => Icon::Bolt,
+        Kind::SshKey => Icon::Terminal,
+        Kind::Server => Icon::Stack,
+        Kind::Database => Icon::Cylinder,
+        Kind::Wifi => Icon::Wave,
+        Kind::Device => Icon::Monitor,
+        Kind::Vpn => Icon::Tunnel,
+        Kind::Certificate => Icon::Rosette,
+        Kind::RecoveryCodes => Icon::ListLines,
+        Kind::CryptoWallet => Icon::Coin,
+        Kind::BankCard => Icon::Card,
+        Kind::SecureNote => Icon::Sheet,
+        Kind::License => Icon::Seal,
+    }
+}
+
+/// The colour that stands for a category.
+///
+/// Hue only, at a fixed saturation and lightness chosen per theme, so no
+/// category can come out unreadable against either background. The hues are
+/// spread deliberately rather than generated, so that neighbours in the
+/// sidebar are never neighbours on the colour wheel.
+fn kind_color(k: Kind) -> egui::Color32 {
+    const HUES: [f32; 16] = [
+        205.0, // Website      blue
+        150.0, // Email        green
+        265.0, // Authenticator violet
+        45.0,  // API key      amber
+        20.0,  // SSH key      orange
+        220.0, // Server       indigo
+        190.0, // Database     teal
+        170.0, // Wi-Fi        sea green
+        240.0, // Device       periwinkle
+        280.0, // VPN          purple
+        330.0, // Certificate  pink
+        95.0,  // Recovery     lime
+        35.0,  // Wallet       gold
+        0.0,   // Bank card    red
+        60.0,  // Note         yellow
+        310.0, // Licence      magenta
+    ];
+    let hue = HUES[k.as_i64() as usize % 16] / 360.0;
+    let light_bg = pal().bg.r() > 128;
+    // `Hsva` is LINEAR, not sRGB: a value of 0.68 comes out around 0.85 on
+    // screen. Read as sRGB numbers these look sensible and render washed out,
+    // which is how the first version put pastel icons on a white sidebar.
+    egui::Color32::from(egui::ecolor::Hsva::new(
+        hue,
+        if light_bg { 0.90 } else { 0.58 },
+        if light_bg { 0.26 } else { 0.92 },
+        1.0,
+    ))
 }
 
 /// Draw `icon` into a square of `size`, in `color`.
@@ -1190,6 +1348,174 @@ fn icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: egui::Color32) {
         Icon::Close => {
             line(p, (6.0, 6.0), (18.0, 18.0));
             line(p, (18.0, 6.0), (6.0, 18.0));
+        }
+
+        // ── Categories ───────────────────────────────────────────────────
+        Icon::Globe => {
+            p.circle_stroke(at(12.0, 12.0), 8.5 * u, stroke);
+            line(p, (3.5, 12.0), (20.5, 12.0));
+            // The meridian: an ellipse, drawn as a polyline because a circle
+            // stroke would read as a second globe rather than as depth.
+            let mut pts = Vec::new();
+            for i in 0..=24 {
+                let a = std::f32::consts::TAU * i as f32 / 24.0;
+                pts.push(at(12.0 + 4.6 * a.sin(), 12.0 - 8.5 * a.cos()));
+            }
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Envelope => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(3.0, 5.5), at(21.0, 18.5)),
+                egui::Rounding::same(2.0 * u),
+                stroke,
+            );
+            let pts = vec![at(3.0, 7.0), at(12.0, 13.5), at(21.0, 7.0)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::ShieldClock => {
+            // A shield, because it guards; a hand, because it is the clock that
+            // makes the code change.
+            let pts = vec![at(12.0, 3.0), at(20.0, 6.5), at(20.0, 12.0), at(12.0, 21.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(12.0, 21.0), at(4.0, 12.0), at(4.0, 6.5), at(12.0, 3.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            line(p, (12.0, 8.0), (12.0, 12.0));
+            line(p, (12.0, 12.0), (15.0, 13.5));
+        }
+        Icon::Bolt => {
+            let pts = vec![at(13.5, 2.5), at(5.5, 13.5), at(11.0, 13.5), at(10.5, 21.5), at(18.5, 10.5), at(13.0, 10.5), at(13.5, 2.5)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Terminal => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(3.0, 4.5), at(21.0, 19.5)),
+                egui::Rounding::same(2.0 * u),
+                stroke,
+            );
+            let pts = vec![at(7.0, 9.5), at(10.5, 12.5), at(7.0, 15.5)];
+            p.add(egui::Shape::line(pts, stroke));
+            line(p, (13.0, 15.5), (17.5, 15.5));
+        }
+        Icon::Stack => {
+            for y in [5.5f32, 11.0, 16.5] {
+                p.rect_stroke(
+                    egui::Rect::from_min_max(at(3.5, y), at(20.5, y + 3.6)),
+                    egui::Rounding::same(1.2 * u),
+                    stroke,
+                );
+                p.circle_filled(at(6.5, y + 1.8), 1.0 * u, color);
+            }
+        }
+        Icon::Cylinder => {
+            // Top ellipse, then the two sides and the front of the base.
+            let ellipse = |cy: f32, from: f32, to: f32| {
+                let mut pts = Vec::new();
+                let steps = 24;
+                for i in 0..=steps {
+                    let a = from + (to - from) * i as f32 / steps as f32;
+                    pts.push(at(12.0 + 7.5 * a.cos(), cy + 3.2 * a.sin()));
+                }
+                pts
+            };
+            use std::f32::consts::{PI, TAU};
+            p.add(egui::Shape::line(ellipse(6.5, 0.0, TAU), stroke));
+            line(p, (4.5, 6.5), (4.5, 17.5));
+            line(p, (19.5, 6.5), (19.5, 17.5));
+            p.add(egui::Shape::line(ellipse(17.5, 0.0, PI), stroke));
+        }
+        Icon::Wave => {
+            // Three arcs and a dot: the universal shape for "signal", and the
+            // only one that stays legible at 14 pixels.
+            for r in [4.0f32, 7.5, 11.0] {
+                let mut pts = Vec::new();
+                for i in 0..=16 {
+                    let a = std::f32::consts::PI * (0.15 + 0.7 * i as f32 / 16.0);
+                    pts.push(at(12.0 - r * a.cos(), 18.0 - r * a.sin()));
+                }
+                p.add(egui::Shape::line(pts, stroke));
+            }
+            p.circle_filled(at(12.0, 18.5), 1.5 * u, color);
+        }
+        Icon::Monitor => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(2.5, 4.0), at(21.5, 16.0)),
+                egui::Rounding::same(2.0 * u),
+                stroke,
+            );
+            line(p, (12.0, 16.0), (12.0, 19.5));
+            line(p, (7.5, 19.5), (16.5, 19.5));
+        }
+        Icon::Tunnel => {
+            // A tunnel mouth: straight walls with a domed top, and a smaller
+            // opening inside it. The first attempt was two bare arches sitting
+            // on the baseline, which at 14 pixels read as a half-closed eye —
+            // the walls are what make it a way *through* something.
+            let mouth = |r: f32, shoulder: f32| {
+                let mut pts = vec![at(12.0 - r, 20.5)];
+                for i in 0..=20 {
+                    let a = std::f32::consts::PI * i as f32 / 20.0;
+                    pts.push(at(12.0 - r * a.cos(), shoulder - r * a.sin()));
+                }
+                pts.push(at(12.0 + r, 20.5));
+                pts
+            };
+            p.add(egui::Shape::line(mouth(8.5, 13.5), stroke));
+            p.add(egui::Shape::line(mouth(3.6, 13.5), stroke));
+            line(p, (3.5, 20.5), (20.5, 20.5));
+        }
+        Icon::Rosette => {
+            p.circle_stroke(at(12.0, 9.0), 6.0 * u, stroke);
+            let pts = vec![at(8.5, 13.8), at(7.0, 21.5), at(12.0, 18.5), at(17.0, 21.5), at(15.5, 13.8)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::ListLines => {
+            for y in [7.0f32, 12.0, 17.0] {
+                p.circle_filled(at(5.0, y), 1.4 * u, color);
+                line(p, (9.5, y), (20.0, y));
+            }
+        }
+        Icon::Coin => {
+            p.circle_stroke(at(12.0, 12.0), 8.5 * u, stroke);
+            line(p, (12.0, 5.5), (12.0, 18.5));
+            let pts = vec![at(15.0, 8.5), at(10.0, 8.5), at(8.5, 10.5), at(10.0, 12.0), at(15.0, 12.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(15.0, 12.0), at(16.0, 13.8), at(14.5, 15.5), at(9.0, 15.5)];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        Icon::Card => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(2.5, 5.5), at(21.5, 18.5)),
+                egui::Rounding::same(2.5 * u),
+                stroke,
+            );
+            line(p, (2.5, 9.5), (21.5, 9.5));
+            line(p, (6.0, 14.5), (11.0, 14.5));
+        }
+        Icon::Sheet => {
+            // A page with the corner turned: it holds text, and nothing else.
+            let pts = vec![at(5.0, 3.0), at(14.0, 3.0), at(19.0, 8.0), at(19.0, 21.0), at(5.0, 21.0), at(5.0, 3.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(14.0, 3.0), at(14.0, 8.0), at(19.0, 8.0)];
+            p.add(egui::Shape::line(pts, stroke));
+            for y in [12.0f32, 15.5] {
+                line(p, (8.0, y), (16.0, y));
+            }
+        }
+        Icon::Seal => {
+            // A scalloped disc: the shape of something stamped as genuine.
+            // Eight lobes, not ten — at 14 pixels the finer scallop stopped
+            // being a shape and became a fuzzy edge, and the tick inside it
+            // was lost in the noise.
+            let mut pts = Vec::new();
+            let lobes = 8.0f32;
+            for i in 0..=64 {
+                let a = std::f32::consts::TAU * i as f32 / 64.0;
+                let r = 7.9 + 1.5 * (a * lobes).cos();
+                pts.push(at(12.0 + r * a.cos(), 12.0 + r * a.sin()));
+            }
+            p.add(egui::Shape::line(pts, stroke));
+            let pts = vec![at(8.0, 12.2), at(10.8, 15.0), at(16.0, 9.0)];
+            p.add(egui::Shape::line(pts, stroke));
         }
     }
 }
@@ -1373,6 +1699,14 @@ impl eframe::App for App {
                 if let (Ok(v), Ok(pw)) =
                     (std::env::var("KEYPAL_SHOT_VAULT"), std::env::var("KEYPAL_SHOT_PASS"))
                 {
+                    // KEYPAL_SHOT_LIGHT=1 photographs the light theme. Colour
+                    // chosen per theme is exactly the kind of thing that goes
+                    // wrong in only one of them, and stays wrong because only
+                    // the other one is ever looked at.
+                    if std::env::var("KEYPAL_SHOT_LIGHT").is_ok() {
+                        self.light = true;
+                        apply_theme(ctx, true);
+                    }
                     self.manual_path = v;
                     self.passphrase = pw;
                     self.unlock();
@@ -1386,8 +1720,33 @@ impl eframe::App for App {
                             "trash" => Panel::Trash,
                             _ => Panel::List,
                         };
+                        // KEYPAL_SHOT_KIND=<number> picks a category: which
+                        // form the editor shows, and which entry the detail
+                        // pane opens. Without it only the default form can be
+                        // seen, and sixteen forms that nobody can look at are
+                        // sixteen forms nobody has checked.
+                        let want = std::env::var("KEYPAL_SHOT_KIND")
+                            .ok()
+                            .and_then(|k| k.trim().parse::<i64>().ok())
+                            .map(Kind::from_i64);
+                        if let Some(k) = want {
+                            self.draft.kind = k;
+                        }
                         if panel == "detail" {
-                            self.open_entry = self.rows.first().map(|r| r.id);
+                            let row = self.rows.iter().find(|r| want.is_none_or(|k| r.kind == k));
+                            self.open_entry = row.map(|r| r.id);
+                            // KEYPAL_SHOT_REVEAL=1 opens every hidden field, so
+                            // the revealed layout can be checked too — it is
+                            // the state a masked field is never photographed in
+                            // and therefore the one that breaks unnoticed.
+                            if std::env::var("KEYPAL_SHOT_REVEAL").is_ok() {
+                                self.reveal_password = true;
+                                self.reveal_notes = true;
+                                if let Some(r) = row {
+                                    self.revealed_fields =
+                                        r.fields.iter().map(|(k, _)| k.clone()).collect();
+                                }
+                            }
                         }
                     }
                 }
@@ -1419,7 +1778,15 @@ impl eframe::App for App {
                     }
                 }
                 let _ = std::fs::write(&path, png);
-                std::process::exit(0);
+                // `_exit`, not `exit`. The PNG is already written and closed,
+                // so nothing is lost by skipping the atexit handlers — and
+                // running them tears the Wayland connection down underneath
+                // the clipboard thread, which is still blocked in
+                // `wl_display_read_events`. That race segfaulted roughly one
+                // run in three, after a correct screenshot: a crash that says
+                // nothing about the program and makes every other crash report
+                // harder to believe.
+                unsafe { libc::_exit(0) };
             }
         }
 
@@ -1606,6 +1973,7 @@ impl App {
                 has_uri: r.uri.is_some(),
                 updated_at: r.updated_at,
                 expires_at: None,
+                kind: r.kind,
             })
             .collect();
         let now = std::time::SystemTime::now()
@@ -1621,7 +1989,7 @@ impl App {
         ui.add_space(4.0);
 
         let total = self.rows.len();
-        let all_selected = self.tag_filter.is_none();
+        let all_selected = self.tag_filter.is_none() && self.kind_filter.is_none();
         if ui
             .selectable_label(
                 all_selected,
@@ -1631,6 +1999,7 @@ impl App {
             .clicked()
         {
             self.tag_filter = None;
+            self.kind_filter = None;
         }
 
         let favs = self.rows.iter().filter(|r| r.favorite).count();
@@ -1645,6 +2014,45 @@ impl App {
                 .clicked()
             {
                 self.tag_filter = if on { None } else { Some("\u{2605}".into()) };
+            }
+        }
+
+        // Categories, with counts. Only the ones the vault actually contains:
+        // sixteen headings above a vault holding three of them is a filing
+        // cabinet with thirteen empty drawers, and it pushes the tags and the
+        // health score off the bottom of the pane.
+        let mut kind_counts: std::collections::BTreeMap<Kind, usize> = Default::default();
+        for r in &self.rows {
+            *kind_counts.entry(r.kind).or_insert(0) += 1;
+        }
+        if kind_counts.len() > 1 {
+            ui.add_space(12.0);
+            label(ui, "CATEGORIES");
+            ui.add_space(4.0);
+            for (k, n) in kind_counts {
+                let on = self.kind_filter == Some(k);
+                let tint = kind_color(k);
+                let resp = ui
+                    .horizontal(|ui| {
+                        ui.add_space(2.0);
+                        icon(ui, kind_icon(k), 13.0, tint);
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("{}   {n}", k.label()))
+                                .size(12.5)
+                                .color(if on { tint } else { pal().text }),
+                        );
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    // Clicking the active one clears it, so the filter can be
+                    // undone where it was set rather than only from "All".
+                    self.kind_filter = if on { None } else { Some(k) };
+                }
             }
         }
 
@@ -1725,7 +2133,7 @@ impl App {
                         .color(pal().text),
                 );
                 ui.label(
-                    egui::RichText::new("password vault  ·  by R.K.")
+                    egui::RichText::new("security vault  ·  by R.K.")
                         .size(10.5)
                         .color(pal().muted),
                 );
@@ -2000,7 +2408,11 @@ impl App {
                     || r.username.to_lowercase().contains(&needle)
                     || r.uri.as_deref().unwrap_or("").to_lowercase().contains(&needle)
                     || r.tags.as_deref().unwrap_or("").to_lowercase().contains(&needle)
+                    // The category name too: typing "card" should find the
+                    // bank cards even though no entry is called that.
+                    || r.kind.label().to_lowercase().contains(&needle)
             })
+            .filter(|r| self.kind_filter.is_none_or(|k| r.kind == k))
             .filter(|r| match self.tag_filter.as_deref() {
                 None => true,
                 Some("\u{2605}") => r.favorite,
@@ -2034,7 +2446,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            "Add your first password, or bring the ones you already have.",
+                            "Add a password, a key, a card or a note — or bring what you already have.",
                         )
                         .size(12.5)
                         .color(pal().muted),
@@ -2089,20 +2501,25 @@ impl App {
                                             .strong()
                                             .color(if selected { pal().accent } else { pal().text }),
                                     );
-                                    let mut sub = row.username.clone();
-                                    if row.totp.is_some() {
-                                        if !sub.is_empty() {
-                                            sub.push_str("   ");
+                                    // The category on the second line, as a
+                                    // shape and a word. Without it a mixed
+                                    // vault reads as one undifferentiated list
+                                    // and the categories may as well not exist.
+                                    ui.horizontal(|ui| {
+                                        icon(ui, kind_icon(row.kind), 11.0, kind_color(row.kind));
+                                        ui.add_space(4.0);
+                                        let mut sub = row.kind.label().to_string();
+                                        if !row.username.is_empty() {
+                                            sub.push_str("  ·  ");
+                                            sub.push_str(&row.username);
                                         }
-                                        sub.push_str("2FA");
-                                    }
-                                    if !sub.trim().is_empty() {
+                                        if row.totp.is_some() && row.kind != Kind::Authenticator {
+                                            sub.push_str("  ·  2FA");
+                                        }
                                         ui.label(
-                                            egui::RichText::new(sub)
-                                                .size(11.0)
-                                                .color(pal().muted),
+                                            egui::RichText::new(sub).size(11.0).color(pal().muted),
                                         );
-                                    }
+                                    });
                                 });
                             });
                         })
@@ -2116,6 +2533,7 @@ impl App {
                         self.open_entry = Some(row.id);
                         self.reveal_password = false;
                         self.reveal_notes = false;
+                        self.revealed_fields.clear();
                     }
                     if i != last {
                         ui.add_space(3.0);
@@ -2134,7 +2552,21 @@ impl App {
             ui.horizontal(|ui| {
                 avatar(ui, &row.name, 34.0);
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&row.name).size(18.0).strong().color(pal().accent));
+                    // What this is, under what it is called. Two entries named
+                    // "Acme" — the login and the API key — are otherwise
+                    // indistinguishable at the top of the pane.
+                    ui.horizontal(|ui| {
+                        icon(ui, kind_icon(row.kind), 12.0, kind_color(row.kind));
+                        ui.add_space(3.0);
+                        ui.label(
+                            egui::RichText::new(row.kind.label())
+                                .size(11.0)
+                                .color(kind_color(row.kind)),
+                        );
+                    });
+                });
             });
             ui.add_space(8.0);
             // Reading order, not reverse: Edit is the common action and comes
@@ -2153,6 +2585,7 @@ impl App {
                     if icon_button(ui, Icon::Edit, "Edit") {
                         self.draft = Draft {
                             id: Some(row.id),
+                            kind: row.kind,
                             name: row.name.clone(),
                             username: row.username.clone(),
                             password: row.password.clone(),
@@ -2161,6 +2594,8 @@ impl App {
                             tags: row.tags.clone().unwrap_or_default(),
                             notes: row.notes.clone().unwrap_or_default(),
                             show_password: false,
+                            fields: row.fields.iter().cloned().collect(),
+                            shown_fields: Default::default(),
                         };
                         self.panel = Panel::Editor;
                     }
@@ -2168,7 +2603,7 @@ impl App {
             ui.add_space(8.0);
 
             if !row.username.is_empty() {
-                label(ui, "USERNAME");
+                label(ui, &row.kind.username_label().unwrap_or("USERNAME").to_uppercase());
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&row.username).size(14.0).monospace());
                     if ui.small_button("Copy").clicked() {
@@ -2178,34 +2613,95 @@ impl App {
                 ui.add_space(6.0);
             }
 
-            label(ui, "PASSWORD");
-            ui.horizontal(|ui| {
-                let shown = if self.reveal_password {
-                    row.password.clone()
-                } else {
-                    "•".repeat(row.password.chars().count().min(24))
-                };
-                ui.label(egui::RichText::new(shown).size(14.0).monospace());
-                if ui
-                    .small_button(if self.reveal_password { "Hide" } else { "Show" })
-                    .clicked()
-                {
-                    self.reveal_password = !self.reveal_password;
-                    if self.reveal_password {
-                        if let Some(db) = self.db.as_ref() {
-                            db.log_access(Some(row.id), "reveal");
+            if let Some(secret_label) = row.kind.secret_label() {
+                label(ui, &secret_label.to_uppercase());
+                ui.horizontal(|ui| {
+                    let shown = if self.reveal_password {
+                        row.password.clone()
+                    } else {
+                        "•".repeat(row.password.chars().count().min(24))
+                    };
+                    ui.label(egui::RichText::new(shown).size(14.0).monospace());
+                    if ui
+                        .small_button(if self.reveal_password { "Hide" } else { "Show" })
+                        .clicked()
+                    {
+                        self.reveal_password = !self.reveal_password;
+                        if self.reveal_password {
+                            if let Some(db) = self.db.as_ref() {
+                                db.log_access(Some(row.id), "reveal");
+                            }
                         }
                     }
+                    if ui.small_button("Copy").clicked() {
+                        copy_now = Some(row.password.clone());
+                    }
+                });
+                if row.kind.audits_password_strength() {
+                    meter(ui, &row.password);
                 }
-                if ui.small_button("Copy").clicked() {
-                    copy_now = Some(row.password.clone());
+            }
+
+            // The category's own fields, in the order the category declares
+            // them rather than the order they happen to sit in the blob.
+            for spec in row.kind.extra() {
+                let Some(value) = kind::field_value(&row.fields, spec.key).filter(|v| !v.is_empty())
+                else {
+                    continue;
+                };
+                ui.add_space(6.0);
+                label(ui, &spec.label.to_uppercase());
+                let key = spec.key.to_string();
+                let revealed = !spec.secret || self.revealed_fields.contains(&key);
+
+                // The buttons, then the value. For a one-line field they share
+                // a row; for a private key they cannot — a multi-line value
+                // pushes the buttons down beside its last line, where they read
+                // as belonging to whatever comes next.
+                let mut controls = |ui: &mut egui::Ui, revealed_now: bool| {
+                    if spec.secret
+                        && ui.small_button(if revealed_now { "Hide" } else { "Show" }).clicked()
+                    {
+                        if revealed_now {
+                            self.revealed_fields.remove(&key);
+                        } else {
+                            self.revealed_fields.insert(key.clone());
+                            if let Some(db) = self.db.as_ref() {
+                                db.log_access(Some(row.id), "reveal");
+                            }
+                        }
+                    }
+                    if ui.small_button("Copy").clicked() {
+                        copy_now = Some(value.to_string());
+                    }
+                };
+
+                let masked = "•".repeat(value.chars().count().min(24));
+                let shown = if revealed { value } else { masked.as_str() };
+
+                if spec.multiline && revealed {
+                    ui.horizontal(|ui| controls(ui, revealed));
+                    ui.add_space(2.0);
+                    // Its own frame, so a pasted key is visibly one block
+                    // rather than text that happens to have line breaks.
+                    egui::Frame::none()
+                        .fill(pal().surface_hi)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(shown).size(12.0).monospace());
+                        });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(shown).size(13.0).monospace());
+                        controls(ui, revealed);
+                    });
                 }
-            });
-            meter(ui, &row.password);
+            }
 
             if let Some(uri) = &row.uri {
                 ui.add_space(6.0);
-                label(ui, "URL");
+                label(ui, &row.kind.uri_label().unwrap_or("URL").to_uppercase());
                 ui.horizontal(|ui| {
                     ui.hyperlink_to(egui::RichText::new(uri).size(13.0), uri);
                     if ui.small_button("Copy").clicked() {
@@ -2294,6 +2790,71 @@ impl App {
         });
     }
 
+    /// The sixteen categories as a grid of shapes, not a dropdown.
+    ///
+    /// A dropdown hides fifteen of the sixteen until you open it, so choosing
+    /// means reading a list from memory of what might be in it. Laid out at
+    /// once, the choice is recognition rather than recall — and the icons make
+    /// it recognition by shape, which is faster than by word.
+    fn kind_picker(&mut self, ui: &mut egui::Ui) {
+        const PER_ROW: usize = 4;
+        const CELL: f32 = 118.0;
+
+        for chunk in kind::ALL.chunks(PER_ROW) {
+            ui.horizontal(|ui| {
+                for k in chunk {
+                    let k = *k;
+                    let on = self.draft.kind == k;
+                    let tint = kind_color(k);
+
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(CELL, 34.0),
+                        egui::Sense::click(),
+                    );
+                    let hot = resp.hovered();
+                    let fill = if on {
+                        tint.linear_multiply(0.30)
+                    } else if hot {
+                        pal().surface_hi
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, egui::Rounding::same(8.0), fill);
+                    if on {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::Rounding::same(8.0),
+                            egui::Stroke::new(1.2_f32, tint),
+                        );
+                    }
+                    // Drawn straight into the allocated rectangle: a nested
+                    // horizontal layout here would re-measure and let the
+                    // longest label push its neighbours out of the grid.
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    icon(&mut child, kind_icon(k), 16.0, tint);
+                    child.add_space(6.0);
+                    child.label(
+                        egui::RichText::new(k.label())
+                            .size(11.5)
+                            .color(if on { pal().text } else { pal().muted }),
+                    );
+
+                    if hot {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        self.draft.kind = k;
+                    }
+                }
+            });
+            ui.add_space(3.0);
+        }
+    }
+
     fn editor(&mut self, ui: &mut egui::Ui) {
         form(ui, |ui| {
             let editing = self.draft.id.is_some();
@@ -2304,48 +2865,134 @@ impl App {
             );
             ui.add_space(8.0);
 
+            // The category comes FIRST, because everything below it depends on
+            // the answer. Asking for it last — or hiding it in a menu — is what
+            // turns a categorised vault back into a list of website logins with
+            // an unused dropdown.
+            label(ui, "WHAT IS THIS?");
+            ui.add_space(2.0);
+            self.kind_picker(ui);
+
+            ui.add_space(10.0);
+            let k = self.draft.kind;
+
             label(ui, "NAME");
             let mut name = self.draft.name.clone();
-            field(ui, &mut name, "GitHub", false);
+            field(ui, &mut name, k.name_hint(), false);
             self.draft.name = name;
 
-            ui.add_space(8.0);
-            label(ui, "USERNAME");
-            let mut user = self.draft.username.clone();
-            field(ui, &mut user, "you@example.com", false);
-            self.draft.username = user;
+            if let Some(user_label) = k.username_label() {
+                ui.add_space(8.0);
+                label(ui, &user_label.to_uppercase());
+                let mut user = self.draft.username.clone();
+                let hint = if k == Kind::Email { "you@example.com" } else { "you" };
+                field(ui, &mut user, hint, false);
+                self.draft.username = user;
+            }
 
-            ui.add_space(8.0);
-            label(ui, "PASSWORD");
-            ui.horizontal(|ui| {
-                let mut pw = self.draft.password.clone();
-                let w = (ui.available_width() - 190.0).max(120.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut pw)
-                        .password(!self.draft.show_password)
-                        .hint_text("password")
-                        .desired_width(w)
-                        .margin(egui::Margin::symmetric(10.0, 7.0)),
-                );
-                self.draft.password = pw;
-                if ui
-                    .small_button(if self.draft.show_password { "Hide" } else { "Show" })
-                    .clicked()
-                {
-                    self.draft.show_password = !self.draft.show_password;
+            if let Some(secret_label) = k.secret_label() {
+                ui.add_space(8.0);
+                label(ui, &secret_label.to_uppercase());
+                ui.horizontal(|ui| {
+                    let mut pw = self.draft.password.clone();
+                    // Generating a card number or a licence key is nonsense;
+                    // the button only appears where a fresh random secret is a
+                    // thing the user could actually want.
+                    let generatable = k.audits_password_strength();
+                    let reserved = if generatable { 190.0 } else { 110.0 };
+                    let w = (ui.available_width() - reserved).max(120.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut pw)
+                            .password(!self.draft.show_password)
+                            .hint_text(secret_label.to_lowercase())
+                            .desired_width(w)
+                            .margin(egui::Margin::symmetric(10.0, 7.0)),
+                    );
+                    self.draft.password = pw;
+                    if ui
+                        .small_button(if self.draft.show_password { "Hide" } else { "Show" })
+                        .clicked()
+                    {
+                        self.draft.show_password = !self.draft.show_password;
+                    }
+                    if generatable && ui.button("Generate").clicked() {
+                        self.draft.password = generate_password();
+                        self.draft.show_password = true;
+                    }
+                });
+                // The strength meter only where strength is a meaningful thing
+                // to report. A bar telling someone their card number is weak is
+                // advice they cannot take.
+                if k.audits_password_strength() {
+                    meter(ui, &self.draft.password.clone());
                 }
-                if ui.button("Generate").clicked() {
-                    self.draft.password = generate_password();
-                    self.draft.show_password = true;
-                }
-            });
-            meter(ui, &self.draft.password.clone());
+            }
 
-            ui.add_space(8.0);
-            label(ui, "URL (optional)");
-            let mut uri = self.draft.uri.clone();
-            field(ui, &mut uri, "https://github.com", false);
-            self.draft.uri = uri;
+            // The category's own fields, in the order the category declares.
+            for spec in k.extra() {
+                ui.add_space(8.0);
+                label(ui, &spec.label.to_uppercase());
+                let key = spec.key.to_string();
+                let mut value = self.draft.field(&key);
+                if spec.multiline {
+                    let revealed = self.draft.shown_fields.contains(&key);
+                    if spec.secret && !revealed {
+                        if ui.small_button(format!("Show {}", spec.label.to_lowercase())).clicked() {
+                            self.draft.shown_fields.insert(key.clone());
+                        }
+                        if !value.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("{} characters stored", value.chars().count()))
+                                    .size(11.0)
+                                    .color(pal().muted),
+                            );
+                        }
+                    } else {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut value)
+                                .hint_text(spec.hint)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4),
+                        );
+                        if spec.secret && ui.small_button("Hide").clicked() {
+                            self.draft.shown_fields.remove(&key);
+                        }
+                    }
+                } else if spec.secret {
+                    let revealed = self.draft.shown_fields.contains(&key);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut value)
+                                .password(!revealed)
+                                .hint_text(spec.hint)
+                                // Reserve enough for the button. Too tight and
+                                // the row overflows, which widens the whole
+                                // form — so the panel jumped a few pixels
+                                // sideways every time the category changed.
+                                .desired_width((ui.available_width() - 84.0).max(120.0))
+                                .margin(egui::Margin::symmetric(10.0, 7.0)),
+                        );
+                        if ui.small_button(if revealed { "Hide" } else { "Show" }).clicked() {
+                            if revealed {
+                                self.draft.shown_fields.remove(&key);
+                            } else {
+                                self.draft.shown_fields.insert(key.clone());
+                            }
+                        }
+                    });
+                } else {
+                    field(ui, &mut value, spec.hint, false);
+                }
+                self.draft.fields.insert(key, value);
+            }
+
+            if let Some(uri_label) = k.uri_label() {
+                ui.add_space(8.0);
+                label(ui, &format!("{} (OPTIONAL)", uri_label.to_uppercase()));
+                let mut uri = self.draft.uri.clone();
+                field(ui, &mut uri, "https://github.com", false);
+                self.draft.uri = uri;
+            }
 
             ui.add_space(8.0);
             label(ui, "TAGS (optional, comma separated)");
@@ -2355,7 +3002,8 @@ impl App {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                label(ui, "NOTES (optional)");
+                // For a secure note the note is not an extra — it is the entry.
+                label(ui, if k == Kind::SecureNote { "NOTE" } else { "NOTES (optional)" });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Load a text file…").clicked() {
                         self.loading_text = !self.loading_text;
@@ -2411,16 +3059,27 @@ impl App {
             );
             self.draft.notes = nt;
 
-            ui.add_space(8.0);
-            label(ui, "TWO-FACTOR SECRET (optional)");
-            let mut t = self.draft.totp.clone();
-            field(ui, &mut t, "base32 secret, or an otpauth:// link", false);
-            self.draft.totp = t;
-            ui.label(
-                egui::RichText::new("Paste what the site shows next to its QR code.")
-                    .size(11.0)
-                    .color(pal().muted),
-            );
+            if k.uses_totp() {
+                ui.add_space(8.0);
+                // For an authenticator this is not an optional extra — it is
+                // the entry.
+                label(
+                    ui,
+                    if k == Kind::Authenticator {
+                        "TWO-FACTOR SECRET"
+                    } else {
+                        "TWO-FACTOR SECRET (optional)"
+                    },
+                );
+                let mut t = self.draft.totp.clone();
+                field(ui, &mut t, "base32 secret, or an otpauth:// link", false);
+                self.draft.totp = t;
+                ui.label(
+                    egui::RichText::new("Paste what the site shows next to its QR code.")
+                        .size(11.0)
+                        .color(pal().muted),
+                );
+            }
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2870,9 +3529,15 @@ impl App {
                 );
 
                 h(ui, "What it is");
-                para(ui, "A password vault that keeps everything on this machine. \
-                          There is no account, no server, no sync, and nothing is sent \
-                          anywhere — including to us.");
+                para(ui, "A vault for security items that keeps everything on this \
+                          machine. There is no account, no server, no sync, and nothing \
+                          is sent anywhere — including to us.");
+                para(ui, "Passwords are only one of sixteen kinds of thing it holds: \
+                          API keys, SSH keys, servers, databases, Wi-Fi networks, VPNs, \
+                          certificates, recovery codes, crypto wallets, bank cards, \
+                          licences, secure notes. Each has its own form, so a card has \
+                          a CVV and an expiry rather than a password and four lines of \
+                          notes pretending to be one.");
 
                 h(ui, "How your passwords are protected");
                 para(ui, "Your passphrase is put through Argon2id, the winner of the \

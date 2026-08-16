@@ -13,6 +13,7 @@ pub mod circuit_breaker;
 pub mod dbus;
 pub mod totp;
 pub mod audit;
+pub mod kind;
 pub mod import;
 pub mod export;
 pub mod crypto;

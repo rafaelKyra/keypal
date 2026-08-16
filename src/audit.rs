@@ -96,6 +96,7 @@ pub fn entropy_bits(password: &str) -> f32 {
 }
 
 /// One entry as the audit needs to see it.
+#[derive(Default)]
 pub struct AuditInput<'a> {
     pub id: i64,
     pub name: &'a str,
@@ -104,6 +105,21 @@ pub struct AuditInput<'a> {
     pub has_uri: bool,
     pub updated_at: i64,
     pub expires_at: Option<i64>,
+    /// What kind of item this is. A secure note has no password, so it cannot
+    /// have a weak one; an authenticator IS the second factor, so telling it to
+    /// get one is nonsense. Judging every category by the rules for a website
+    /// login fills the report with findings nobody can act on.
+    pub kind: crate::kind::Kind,
+}
+
+/// Whether this entry's secret is a password that can be judged as one.
+///
+/// It must be a category whose secret the user chose (so "weak" and "reused"
+/// mean something), and it must actually have one — an entry saved with the
+/// password left empty is not the world's weakest password, it is an entry
+/// with no password.
+fn scorable(e: &AuditInput<'_>) -> bool {
+    e.kind.audits_password_strength() && !e.password.is_empty()
 }
 
 /// Score a vault. `now` is passed in so the result is testable rather than
@@ -112,8 +128,12 @@ pub fn audit(entries: &[AuditInput<'_>], now: i64) -> Report {
     // Count each distinct password once so reuse is symmetric: if two entries
     // share a password, BOTH are flagged. Flagging only the later one would
     // suggest the first is fine.
+    //
+    // Only scorable entries are counted. Two secure notes sharing an empty
+    // password are not "reused", and neither are two copies of the same API
+    // token — that is untidy, not a security flaw.
     let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for e in entries {
+    for e in entries.iter().filter(|e| scorable(e)) {
         *seen.entry(e.password).or_insert(0) += 1;
     }
 
@@ -123,13 +143,15 @@ pub fn audit(entries: &[AuditInput<'_>], now: i64) -> Report {
     for e in entries {
         let mut issues = Vec::new();
 
-        if entropy_bits(e.password) < WEAK_BITS {
-            issues.push(Issue::Weak);
-            weak += 1;
-        }
-        if seen.get(e.password).copied().unwrap_or(0) > 1 {
-            issues.push(Issue::Reused);
-            reused += 1;
+        if scorable(e) {
+            if entropy_bits(e.password) < WEAK_BITS {
+                issues.push(Issue::Weak);
+                weak += 1;
+            }
+            if seen.get(e.password).copied().unwrap_or(0) > 1 {
+                issues.push(Issue::Reused);
+                reused += 1;
+            }
         }
         if let Some(at) = e.expires_at {
             if at <= now {
@@ -138,12 +160,17 @@ pub fn audit(entries: &[AuditInput<'_>], now: i64) -> Report {
             }
         }
         // Expiry supersedes staleness: reporting both for the same entry says
-        // the same thing twice and double-charges the score.
-        if !issues.contains(&Issue::Expired) && now.saturating_sub(e.updated_at) > STALE_AFTER {
+        // the same thing twice and double-charges the score. Staleness is also
+        // only meaningful for a password you could rotate — a passport number
+        // untouched for two years is not a finding.
+        if scorable(e)
+            && !issues.contains(&Issue::Expired)
+            && now.saturating_sub(e.updated_at) > STALE_AFTER
+        {
             issues.push(Issue::Stale);
             stale += 1;
         }
-        if e.has_uri && !e.has_totp {
+        if e.kind.wants_two_factor() && e.has_uri && !e.has_totp {
             issues.push(Issue::NoTwoFactor);
         }
 
@@ -195,10 +222,8 @@ mod tests {
             id,
             name,
             password: pw,
-            has_totp: false,
-            has_uri: false,
             updated_at: NOW,
-            expires_at: None,
+            ..Default::default()
         }
     }
 
@@ -250,10 +275,9 @@ mod tests {
             id: 1,
             name: "Old",
             password: "T7#kq9Zm!wR2xL4vB8n",
-            has_totp: false,
-            has_uri: false,
             updated_at: old,
             expires_at: Some(NOW - 10),
+            ..Default::default()
         };
         let report = audit(&[e], NOW);
         let issues = &report.findings[0].issues;
@@ -300,16 +324,81 @@ mod tests {
                 id: i as i64,
                 name: "Good",
                 password: pw,
-                has_totp: false,
-                has_uri: false,
                 updated_at: NOW,
-                expires_at: None,
+                ..Default::default()
             })
             .collect();
         entries.push(entry(100, "Bad", "abc"));
         let report = audit(&entries, NOW);
         assert!(report.score > 90, "score was {}", report.score);
         assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn a_secure_note_is_never_reported_as_a_weak_password() {
+        // It has no password. Judging it by the rules for a website login is
+        // how a health report fills with findings nobody can act on — and a
+        // report nobody can act on is one people stop opening.
+        use crate::kind::Kind;
+        let note = AuditInput {
+            kind: Kind::SecureNote,
+            password: "",
+            updated_at: NOW - (400 * 24 * 60 * 60),
+            ..entry(1, "Passport", "")
+        };
+        let report = audit(&[note], NOW);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.score, 100);
+        assert_eq!(report.weak, 0);
+        assert_eq!(report.stale, 0);
+    }
+
+    #[test]
+    fn two_notes_with_no_password_are_not_each_others_reuse() {
+        // Under a kind-blind audit both would share the empty string and be
+        // flagged as reusing it, which is the most confusing possible advice.
+        use crate::kind::Kind;
+        let a = AuditInput { kind: Kind::SecureNote, ..entry(1, "A", "") };
+        let b = AuditInput { kind: Kind::SecureNote, ..entry(2, "B", "") };
+        let report = audit(&[a, b], NOW);
+        assert_eq!(report.reused, 0);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_generated_token_is_a_secret_but_not_a_weak_password() {
+        // The user did not choose it and cannot improve it. It is still stored
+        // and still shredded like every other secret — it is only the *scoring*
+        // that does not apply.
+        use crate::kind::Kind;
+        let token = AuditInput { kind: Kind::ApiKey, ..entry(1, "Stripe", "sk_test") };
+        assert!(audit(&[token], NOW).findings.is_empty());
+
+        // The same string under a website login IS weak, which is what shows
+        // the difference is the category and not the string.
+        let login = entry(1, "Site", "sk_test");
+        assert!(audit(&[login], NOW).findings[0].issues.contains(&Issue::Weak));
+    }
+
+    #[test]
+    fn an_authenticator_is_not_told_to_get_a_second_factor() {
+        use crate::kind::Kind;
+        let e = AuditInput {
+            kind: Kind::Authenticator,
+            has_uri: true,
+            has_totp: true,
+            ..entry(1, "GitHub 2FA", "")
+        };
+        assert!(audit(&[e], NOW).findings.is_empty());
+    }
+
+    #[test]
+    fn a_wifi_password_is_still_judged_as_a_password() {
+        // Kind-awareness must not become a blanket excuse: a Wi-Fi key is
+        // chosen by a human and can be terrible, so it stays in scope.
+        use crate::kind::Kind;
+        let e = AuditInput { kind: Kind::Wifi, ..entry(1, "Home", "password1") };
+        assert!(audit(&[e], NOW).findings[0].issues.contains(&Issue::Weak));
     }
 
     #[test]

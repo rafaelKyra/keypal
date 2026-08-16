@@ -109,6 +109,16 @@ impl VaultDatabase {
             "ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE entries ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE entries ADD COLUMN expires_at INTEGER",
+            // What kind of security item this is. 0 is Website, which is what
+            // every row written before this column genuinely was — the default
+            // reclassifies nothing.
+            "ALTER TABLE entries ADD COLUMN kind INTEGER NOT NULL DEFAULT 0",
+            // Category-specific fields, AEAD-encrypted as one blob under the
+            // EIGHTH nonce. Deliberately not a second table: a per-field table
+            // would mean a second write path with its own nonce derivation, and
+            // nonces are the one thing in this design that must be derived in
+            // exactly one place.
+            "ALTER TABLE entries ADD COLUMN fields_enc BLOB",
             // Why a password changed. Plaintext by design: "rotated after the
             // Acme breach" is context, not a secret, and encrypting it would
             // mean it could not be read without unlocking — which is when you
@@ -179,7 +189,8 @@ impl VaultDatabase {
         let key = session.enc_key();
         let row = self.conn.query_row(
             "SELECT name_enc, user_enc, pass_enc, uri_enc, totp_secret, nonce, \
-             notes_enc, tags_enc, favorite, created_at, updated_at, deleted_at \
+             notes_enc, tags_enc, favorite, created_at, updated_at, deleted_at, \
+             kind, fields_enc \
              FROM entries WHERE id=?1",
             [id],
             |r| {
@@ -196,6 +207,8 @@ impl VaultDatabase {
                     r.get::<_, i64>(9)?,
                     r.get::<_, i64>(10)?,
                     r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, i64>(12)?,
+                    r.get::<_, Option<Vec<u8>>>(13)?,
                 ))
             },
         );
@@ -203,6 +216,7 @@ impl VaultDatabase {
         let (
             name_ct, user_ct, pass_ct, uri_ct, totp_ct, nonce_b,
             notes_ct, tags_ct, favorite, created_at, updated_at, deleted_at,
+            kind_n, fields_ct,
         ) = match row {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -211,11 +225,12 @@ impl VaultDatabase {
 
         // The nonce column holds one 12-byte nonce per field, concatenated.
         // Rows written before notes and tags existed carry 5 (60 bytes); rows
-        // written since carry 7 (84). Accepting both is what lets an existing
-        // vault open after the upgrade instead of reporting corruption.
-        if nonce_b.len() != 60 && nonce_b.len() != 84 {
+        // written after that carry 7 (84); rows written since category fields
+        // carry 8 (96). Accepting all three is what lets an existing vault open
+        // after the upgrade instead of reporting corruption.
+        if !matches!(nonce_b.len(), 60 | 84 | 96) {
             return Err(crate::ValuError::Crypto(format!(
-                "bad nonce blob: expected 60 or 84 bytes, got {}",
+                "bad nonce blob: expected 60, 84 or 96 bytes, got {}",
                 nonce_b.len()
             )));
         }
@@ -242,7 +257,7 @@ impl VaultDatabase {
 
         // Notes and tags occupy nonce slots 5 and 6, which only exist on rows
         // written after the upgrade. An older row simply has neither.
-        let (notes, tags) = if nonce_b.len() == 84 {
+        let (notes, tags) = if nonce_b.len() >= 84 {
             let notes_nonce: [u8; 12] = nonce_b[60..72].try_into().unwrap();
             let tags_nonce: [u8; 12] = nonce_b[72..84].try_into().unwrap();
             let notes = notes_ct
@@ -258,6 +273,17 @@ impl VaultDatabase {
             (None, None)
         };
 
+        // Slot 7: the category fields blob.
+        let fields = if nonce_b.len() == 96 {
+            let fields_nonce: [u8; 12] = nonce_b[84..96].try_into().unwrap();
+            fields_ct
+                .map(|c| aead::decrypt(self.cipher, key, &fields_nonce, &c))
+                .transpose()?
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        } else {
+            None
+        };
+
         Ok(Some(Entry {
             name,
             username,
@@ -266,6 +292,8 @@ impl VaultDatabase {
             totp_secret: totp_secret.map(Secret::new),
             notes: notes.map(Secret::new),
             tags,
+            kind: crate::kind::Kind::from_i64(kind_n),
+            fields: fields.map(Secret::new),
             favorite: favorite != 0,
             created_at,
             updated_at,
@@ -348,12 +376,41 @@ impl VaultDatabase {
         notes: Option<&str>,
         tags: Option<&str>,
     ) -> Result<i64, crate::ValuError> {
-        let id = self.insert_entry(session, name, username, password, uri, totp_secret)?;
-        if notes.is_some() || tags.is_some() {
-            self.update_entry_full(
-                session, id, name, username, password, uri, totp_secret, notes, tags,
-            )?;
-        }
+        self.insert_draft(
+            session,
+            &EntryDraft {
+                name,
+                username,
+                password,
+                uri,
+                totp_secret,
+                notes,
+                tags,
+                ..EntryDraft::default()
+            },
+        )
+    }
+
+    /// Insert an entry of any category.
+    pub fn insert_draft(
+        &self,
+        session: &KeySession,
+        draft: &EntryDraft<'_>,
+    ) -> Result<i64, crate::ValuError> {
+        let id = self.insert_entry(
+            session,
+            draft.name,
+            draft.username,
+            draft.password,
+            draft.uri,
+            draft.totp_secret,
+        )?;
+        // `insert_entry` writes the five-nonce layout, which has nowhere to put
+        // notes, tags or category fields. Rewriting the row immediately is what
+        // promotes it to the full layout — and it costs one extra write on
+        // creation only, against duplicating the whole encrypt-and-lay-out-
+        // nonces routine a second time, which is where the two would drift.
+        self.update_draft(session, id, draft)?;
         Ok(id)
     }
 
@@ -362,6 +419,10 @@ impl VaultDatabase {
     /// The previous password is copied into `history` under its OWN fresh
     /// nonce before the row is rewritten. Reusing the entry's nonce for the
     /// history copy would put the same keystream on two rows in the same file.
+    ///
+    /// The entry's category and its category fields are left as they are —
+    /// this form does not know about them, and blanking what a caller never
+    /// mentioned would silently reclassify the entry.
     #[allow(clippy::too_many_arguments)]
     pub fn update_entry_full(
         &self,
@@ -375,7 +436,40 @@ impl VaultDatabase {
         notes: Option<&str>,
         tags: Option<&str>,
     ) -> Result<bool, crate::ValuError> {
+        let existing = self.get_entry(session, id)?;
+        let kind = existing.as_ref().map(|e| e.kind).unwrap_or_default();
+        let fields = existing
+            .as_ref()
+            .and_then(|e| e.fields.as_ref())
+            .map(|f| f.expose().clone());
+        self.update_draft(
+            session,
+            id,
+            &EntryDraft {
+                name,
+                username,
+                password,
+                uri,
+                totp_secret,
+                notes,
+                tags,
+                kind,
+                fields: fields.as_deref(),
+            },
+        )
+    }
+
+    /// Overwrite an entry from a draft, category and all.
+    pub fn update_draft(
+        &self,
+        session: &KeySession,
+        id: i64,
+        draft: &EntryDraft<'_>,
+    ) -> Result<bool, crate::ValuError> {
         use rand_core::{OsRng, RngCore};
+
+        let EntryDraft { name, username, password, uri, totp_secret, notes, tags, kind, fields } =
+            *draft;
 
         let key = session.enc_key();
         let now = std::time::SystemTime::now()
@@ -400,7 +494,7 @@ impl VaultDatabase {
             }
         }
 
-        let mut nonces = [[0u8; 12]; 7];
+        let mut nonces = [[0u8; 12]; 8];
         for n in nonces.iter_mut() {
             OsRng.fill_bytes(n);
         }
@@ -422,19 +516,24 @@ impl VaultDatabase {
             .filter(|t| !t.is_empty())
             .map(|t| aead::encrypt(self.cipher, key, &nonces[6], t.as_bytes().to_vec()))
             .transpose()?;
+        let fields_ct: Option<Vec<u8>> = fields
+            .filter(|f| !f.is_empty())
+            .map(|f| aead::encrypt(self.cipher, key, &nonces[7], f.as_bytes().to_vec()))
+            .transpose()?;
 
-        let mut nonce_blob = Vec::with_capacity(84);
+        let mut nonce_blob = Vec::with_capacity(96);
         for n in nonces.iter() {
             nonce_blob.extend_from_slice(n);
         }
 
         let changed = self.conn.execute(
             "UPDATE entries SET name_enc=?2, user_enc=?3, pass_enc=?4, uri_enc=?5, \
-             totp_secret=?6, nonce=?7, updated_at=?8, notes_enc=?9, tags_enc=?10 \
+             totp_secret=?6, nonce=?7, updated_at=?8, notes_enc=?9, tags_enc=?10, \
+             kind=?11, fields_enc=?12 \
              WHERE id=?1",
             rusqlite::params![
                 id, name_ct, user_ct, pass_ct, uri_ct, totp_ct, nonce_blob, now,
-                notes_ct, tags_ct
+                notes_ct, tags_ct, kind.as_i64(), fields_ct
             ],
         )?;
         Ok(changed > 0)
@@ -530,7 +629,7 @@ impl VaultDatabase {
         }
 
         let wipe = session.wipe_key();
-        let mut nonces = [[0u8; 12]; 7];
+        let mut nonces = [[0u8; 12]; 8];
         for n in nonces.iter_mut() {
             OsRng.fill_bytes(n);
         }
@@ -541,17 +640,21 @@ impl VaultDatabase {
             OsRng.fill_bytes(&mut junk);
             aead::encrypt(self.cipher, wipe, &nonces[i], junk.to_vec())
         };
-        let (a, b, c, d, e, f, g) =
-            (blob(0)?, blob(1)?, blob(2)?, blob(3)?, blob(4)?, blob(5)?, blob(6)?);
-        let mut nonce_blob = Vec::with_capacity(84);
+        // Every secret column, the category fields included: a shredded bank
+        // card that left its CVV readable would be worse than not shredding at
+        // all, because the user was told it was gone.
+        let (a, b, c, d, e, f, g, h) = (
+            blob(0)?, blob(1)?, blob(2)?, blob(3)?, blob(4)?, blob(5)?, blob(6)?, blob(7)?,
+        );
+        let mut nonce_blob = Vec::with_capacity(96);
         for n in nonces.iter() {
             nonce_blob.extend_from_slice(n);
         }
 
         self.conn.execute(
             "UPDATE entries SET name_enc=?2, user_enc=?3, pass_enc=?4, uri_enc=?5, \
-             totp_secret=?6, notes_enc=?7, tags_enc=?8, nonce=?9 WHERE id=?1",
-            rusqlite::params![id, a, b, c, d, e, f, g, nonce_blob],
+             totp_secret=?6, notes_enc=?7, tags_enc=?8, fields_enc=?9, nonce=?10 WHERE id=?1",
+            rusqlite::params![id, a, b, c, d, e, f, g, h, nonce_blob],
         )?;
 
         // Same treatment for stored history: those are passwords too.
@@ -759,6 +862,14 @@ pub struct Entry {
     /// Comma-separated labels. Encrypted too: the set of tags in a vault is
     /// itself information about its owner.
     pub tags: Option<String>,
+    /// What kind of security item this is. Decides which fields the editor
+    /// shows and how the health report reads the entry.
+    pub kind: crate::kind::Kind,
+    /// The category's own fields, in the encoding from [`crate::kind`].
+    ///
+    /// A [`Secret`], not a plain string: this is where a CVV, a connection
+    /// string and an SSH private key end up.
+    pub fields: Option<Secret<String>>,
     pub favorite: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -767,13 +878,35 @@ pub struct Entry {
     pub deleted_at: Option<i64>,
 }
 
+/// Everything the caller wants written, in one place.
+///
+/// Passing eleven positional arguments is how a username ends up encrypted into
+/// the password column: the compiler cannot tell two `&str` apart, so a
+/// transposed pair is a silent data corruption rather than a build failure.
+/// Named fields make the mistake unwritable.
+#[derive(Default, Clone, Copy)]
+pub struct EntryDraft<'a> {
+    pub name: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub uri: Option<&'a str>,
+    pub totp_secret: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    pub tags: Option<&'a str>,
+    pub kind: crate::kind::Kind,
+    /// Already encoded — see [`crate::kind::encode_fields`].
+    pub fields: Option<&'a str>,
+}
+
 impl std::fmt::Debug for Entry {
     /// Redacted debug: shows name/username (non-secret context) but masks the rest.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Entry")
             .field("name", &self.name)
+            .field("kind", &self.kind)
             .field("username", &self.username)
             .field("password", &"•••")
+            .field("fields", &"•••")
             .field("uri", &self.uri.as_deref().map(|u| crate::redaction::redact_string(u, crate::redaction::StringPolicy::PartialMask)))
             .finish()
     }
@@ -987,19 +1120,163 @@ mod tests {
         assert_eq!(read_back.name, "Legacy");
         assert!(read_back.notes.is_none());
 
-        // A row written the NEW way carries 84 bytes and round-trips notes/tags.
+        // A row written the NEW way carries one nonce per encrypted column —
+        // eight of them since category fields joined — and round-trips
+        // notes/tags.
         let id = db.insert_entry_full(&session, "Bank", "me", "pw",
             Some("https://bank.example"), None,
             Some("recovery: alpha bravo"), Some("finance,important")).unwrap();
         let blob: Vec<u8> = db.conn()
             .query_row("SELECT nonce FROM entries WHERE id=?1", [id], |r| r.get(0)).unwrap();
-        assert_eq!(blob.len(), 84);
+        assert_eq!(blob.len(), 96);
         let e = db.get_entry(&session, id).unwrap().unwrap();
         assert_eq!(e.notes.as_ref().map(|n| n.expose().as_str()), Some("recovery: alpha bravo"));
         assert_eq!(e.tags.as_deref(), Some("finance,important"));
         assert_eq!(e.uri.as_deref(), Some("https://bank.example"));
 
         drop(db);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+    }
+
+    #[test]
+    fn a_category_and_its_own_fields_round_trip() {
+        use crate::kind::{decode_fields, encode_fields, field_value, Kind};
+        let path = tmp_db("kinds");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        let session = KeySession::new(MasterKey::create_volatile().unwrap());
+        let db = VaultDatabase::open(&path, &session).unwrap();
+
+        let fields = encode_fields(&[
+            ("ssid".into(), "Home-5G".into()),
+            ("admin_ip".into(), "192.168.1.1".into()),
+        ]);
+        let id = db
+            .insert_draft(&session, &EntryDraft {
+                name: "Home Wi-Fi",
+                password: "correct-horse-battery",
+                kind: Kind::Wifi,
+                fields: Some(&fields),
+                ..EntryDraft::default()
+            })
+            .unwrap();
+
+        let e = db.get_entry(&session, id).unwrap().unwrap();
+        assert_eq!(e.kind, Kind::Wifi);
+        let got = decode_fields(e.fields.as_ref().unwrap().expose());
+        assert_eq!(field_value(&got, "ssid"), Some("Home-5G"));
+        assert_eq!(field_value(&got, "admin_ip"), Some("192.168.1.1"));
+
+        // Eight nonces now, one per encrypted column. If the fields blob ever
+        // reused another column's nonce, two secrets would share a keystream.
+        let blob: Vec<u8> = db.conn()
+            .query_row("SELECT nonce FROM entries WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(blob.len(), 96);
+        let mut distinct: std::collections::HashSet<&[u8]> = Default::default();
+        for chunk in blob.chunks(12) {
+            assert!(distinct.insert(chunk), "two columns share a nonce");
+        }
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+    }
+
+    #[test]
+    fn an_entry_written_before_categories_existed_reads_back_as_a_website() {
+        // The migration test. Every row in every existing vault has no `kind`
+        // column at all; it must open, and it must not be reclassified into
+        // something it is not. Those rows ARE website logins.
+        use crate::kind::Kind;
+        let path = tmp_db("kindmigrate");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        let session = KeySession::new(MasterKey::create_volatile().unwrap());
+        let db = VaultDatabase::open(&path, &session).unwrap();
+
+        // `insert_entry` still writes the old five-nonce layout, which is the
+        // closest thing to a pre-upgrade row we can produce here.
+        let legacy = db.insert_entry(&session, "Legacy", "u", "p", None, None).unwrap();
+        let blob: Vec<u8> = db.conn()
+            .query_row("SELECT nonce FROM entries WHERE id=?1", [legacy], |r| r.get(0)).unwrap();
+        assert_eq!(blob.len(), 60);
+        let e = db.get_entry(&session, legacy).unwrap().unwrap();
+        assert_eq!(e.kind, Kind::Website);
+        assert!(e.fields.is_none());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+    }
+
+    #[test]
+    fn editing_an_entry_the_old_way_does_not_silently_reclassify_it() {
+        // `update_entry_full` knows nothing about categories. If it wrote its
+        // default it would turn every bank card into a website the first time
+        // anything else touched the row.
+        use crate::kind::{decode_fields, encode_fields, field_value, Kind};
+        let path = tmp_db("kindkeep");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        let session = KeySession::new(MasterKey::create_volatile().unwrap());
+        let db = VaultDatabase::open(&path, &session).unwrap();
+
+        let fields = encode_fields(&[("cvv".into(), "123".into())]);
+        let id = db
+            .insert_draft(&session, &EntryDraft {
+                name: "Debit card",
+                password: "4111111111111111",
+                kind: Kind::BankCard,
+                fields: Some(&fields),
+                ..EntryDraft::default()
+            })
+            .unwrap();
+
+        db.update_entry_full(&session, id, "Debit card", "R.K.", "4111111111111111",
+            None, None, Some("expires soon"), Some("money")).unwrap();
+
+        let e = db.get_entry(&session, id).unwrap().unwrap();
+        assert_eq!(e.kind, Kind::BankCard, "the category survived an unrelated edit");
+        assert_eq!(
+            field_value(&decode_fields(e.fields.as_ref().unwrap().expose()), "cvv"),
+            Some("123"),
+            "the category's own fields survived too"
+        );
+        assert_eq!(e.notes.as_ref().map(|n| n.expose().as_str()), Some("expires soon"));
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+    }
+
+    #[test]
+    fn purging_shreds_the_category_fields_too() {
+        // A destroyed bank card that left its CVV recoverable in the file is
+        // worse than one that was never destroyed, because the user was told.
+        use crate::kind::{encode_fields, Kind};
+        let path = tmp_db("kindshred");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        let session = KeySession::new(MasterKey::create_volatile().unwrap());
+        let db = VaultDatabase::open(&path, &session).unwrap();
+
+        let fields = encode_fields(&[("cvv".into(), "shred-me-cvv-canary".into())]);
+        let id = db
+            .insert_draft(&session, &EntryDraft {
+                name: "Doomed card",
+                password: "4111111111111111",
+                kind: Kind::BankCard,
+                fields: Some(&fields),
+                ..EntryDraft::default()
+            })
+            .unwrap();
+
+        let ct: Vec<u8> = db.conn()
+            .query_row("SELECT fields_enc FROM entries WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert!(!ct.is_empty(), "control: the fields really were written");
+
+        db.trash_entry(id).unwrap();
+        assert!(db.purge_entry(&session, id).unwrap());
+        drop(db);
+
+        let after = std::fs::read(&path).unwrap_or_default();
+        assert!(
+            !after.windows(ct.len()).any(|w| w == ct),
+            "the category fields ciphertext survived the purge"
+        );
         for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
     }
 
@@ -1325,6 +1602,8 @@ mod tests {
             totp_secret: None,
             notes: Some(Secret::new("recovery code 1234".into())),
             tags: Some("work,email".into()),
+            kind: crate::kind::Kind::Website,
+            fields: Some(Secret::new("cvv\n3\n123\n".into())),
             favorite: true,
             created_at: 0,
             updated_at: 0,
