@@ -2363,7 +2363,7 @@ impl App {
             ui.label(egui::RichText::new("Keypal").size(26.0).strong().color(pal().text));
             ui.add_space(3.0);
             ui.label(
-                egui::RichText::new("Your passwords, kept on this machine and nowhere else")
+                egui::RichText::new("Your keys and passwords, kept on this machine and nowhere else")
                     .size(12.5)
                     .color(pal().muted),
             );
