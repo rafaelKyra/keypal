@@ -56,6 +56,20 @@ then warns and continues: key material is still locked per buffer, and the remai
 exposure is Argon2's temporary working memory during key derivation. Raise the limit
 (`ulimit -l`) or grant `CAP_IPC_LOCK` to close that gap.
 
+## Intended use and limits
+
+- **Use it for your own data.** Keypal is a password and secrets vault. It is not designed to
+  obstruct a lawful investigation or to destroy data you are legally obliged to keep. You are
+  responsible for complying with the law where you live, including any rules on encryption
+  software.
+- **Secure erase has limits.** It overwrites what it can reach, but it cannot reach copies it
+  did not write: remapped SSD blocks, journals, copy-on-write snapshots and backups can still
+  hold older ciphertext, readable by anyone who also has your passphrase. Do not rely on it
+  as a guarantee that data cannot be recovered.
+- **No warranty.** The Apache License disclaims warranty and liability. The code is not
+  independently audited. Keep your own backups of the vault file.
+- **Name.** Other products use the name "Keypal". This project is unrelated to them.
+
 ## Build and test
 
 ```bash

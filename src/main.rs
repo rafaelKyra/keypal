@@ -429,5 +429,5 @@ fn cmd_destroy(args: &[String]) {
 
     // Final destruction: zeroize master + subkeys. After this, nothing is recoverable.
     session.close();
-    tracing::info!("all key material destroyed — vault data is cryptographically unrecoverable");
+    tracing::info!("all key material destroyed — the vault can no longer be decrypted with it");
 }

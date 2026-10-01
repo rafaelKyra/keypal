@@ -198,7 +198,7 @@ Standard `DELETE FROM entries` leaves the plaintext (or ciphertext) in:
  6. ZEROIZE   wipe_key + all in-memory key material; close connection
 ```
 
-After step 5 the on-disk file contains **only** the schema (no data pages), and every prior ciphertext has been overwritten by a different key's output — so even if an old page survived, it is undecryptable without the now-destroyed wipe_key.
+After step 5 the on-disk file contains **only** the schema (no data pages), and every prior ciphertext has been overwritten by a different key's output — so a page *written by the erase* is undecryptable without the now-destroyed wipe_key. **Limit:** the erase cannot reach copies it did not write. A page from *before* step 2 that survives elsewhere — in remapped SSD blocks (wear levelling), a journal, a copy-on-write snapshot or a backup — still holds ciphertext under the original key, which is derived from the passphrase and is not destroyed. Whoever holds such a copy and the passphrase can still read it.
 
 ### 5.3 Safety Contract
 
