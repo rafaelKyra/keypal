@@ -1,7 +1,7 @@
 # Vaultling
 
-An offline password and secrets manager for Linux, written in Rust. It keeps passwords, keys,
-cards and notes in an encrypted local vault.
+**Offline password manager** for Linux, written in Rust. It keeps passwords, keys, cards and
+notes in an encrypted local vault, and also stores TOTP codes and secure notes.
 Everything stays on your machine: there is no account, no sync and no network
 component in the vault itself.
 
