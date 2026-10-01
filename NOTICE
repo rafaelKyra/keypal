@@ -5,11 +5,15 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Not licensed under the Apache License
 -------------------------------------
-The name "Vaultling" and the mascot image (assets/mascot.png) are the property of
-the copyright holder. As Section 6 of the Apache License states, the license
-does not grant permission to use the name, trademarks or branding of the
-Licensor except as required to describe the origin of the Work. Forks and
-derivative works should use their own name and artwork.
+The name "Vaultling" is used by the author to identify this project. As Section 6 of the
+Apache License states, the license does not grant permission to use the name, trademarks
+or branding of the Licensor except as required to describe the origin of the Work.
+
+The mascot image (assets/mascot.png) is not offered under the Apache License. It was
+produced with an AI image generator and lightly post-processed. The author makes no
+statement about its copyright status beyond what applicable law provides, and it is
+included only so that the application builds and runs. Forks and derivative works should
+use their own name and artwork.
 
 Third-party material included in this repository
 ------------------------------------------------
