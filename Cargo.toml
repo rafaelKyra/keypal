@@ -2,7 +2,7 @@
 name = "vaultling"
 version = "1.0.0"
 edition = "2021"
-description = "Vaultling — offline vault for passwords, keys, cards and notes"
+description = "Vaultling — an offline password and secrets manager"
 license = "Apache-2.0"
 authors = ["Rafael Kyra"]
 repository = "https://github.com/rafaelKyra/vaultling"
