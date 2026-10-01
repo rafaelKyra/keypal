@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// One row on the way out. Mirrors what `import::Incoming` reads back in, so a
-/// VALU export re-imports into VALU without loss.
+/// Keypal export re-imports into Keypal without loss.
 pub struct Outgoing {
     pub name: String,
     pub username: String,

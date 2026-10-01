@@ -7,15 +7,15 @@ use sha2::Sha256;
 /// Derive a 32-byte master key from `pass` + `salt` using Argon2id with the given policy.
 /// The output is returned as a plain `Vec<u8>` (caller immediately moves it into a
 /// [`crate::secure_mem::SecureBuffer`] and wipes this transient copy).
-pub fn argon2id_32b(pass: &[u8], salt: &[u8], policy: crate::key_lifecycle::ArgonPolicy) -> Result<Vec<u8>, crate::ValuError> {
+pub fn argon2id_32b(pass: &[u8], salt: &[u8], policy: crate::key_lifecycle::ArgonPolicy) -> Result<Vec<u8>, crate::KeypalError> {
     let params = Params::new(policy.memory_cost_kib, policy.time_cost, policy.parallelism as u32, Some(32))
-        .map_err(|e| crate::ValuError::Crypto(format!("invalid Argon2 params: {e}")))?;
+        .map_err(|e| crate::KeypalError::Crypto(format!("invalid Argon2 params: {e}")))?;
 
     let kdf = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut out = vec![0u8; 32];
     kdf.hash_password_into(pass, salt, &mut out)
-        .map_err(|e| crate::ValuError::Crypto(format!("Argon2id KDF failed: {e}")))?;
+        .map_err(|e| crate::KeypalError::Crypto(format!("Argon2id KDF failed: {e}")))?;
     Ok(out)
 }
 

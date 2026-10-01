@@ -13,10 +13,10 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use valu::key_lifecycle::{KeySession, MasterKey};
-use valu::kind::{self, Kind};
-use valu::storage::{EntryDraft, VaultDatabase};
-use valu::totp;
+use keypal::key_lifecycle::{KeySession, MasterKey};
+use keypal::kind::{self, Kind};
+use keypal::storage::{EntryDraft, VaultDatabase};
+use keypal::totp;
 
 // ── Palette ─────────────────────────────────────────────────────────────────
 //
@@ -427,7 +427,7 @@ fn looks_like_vault(path: &Path) -> bool {
 fn read_salt(path: &Path) -> Result<Vec<u8>, String> {
     let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
     conn.query_row("SELECT value FROM meta WHERE key='argon_salt'", [], |r| r.get(0))
-        .map_err(|_| "not a VALU vault, or it has no salt".to_string())
+        .map_err(|_| "not a Keypal vault, or it has no salt".to_string())
 }
 
 /// 20 characters from a 69-symbol alphabet ≈ 122 bits.
@@ -2186,11 +2186,11 @@ impl App {
         });
     }
 
-    fn security_report(&self) -> valu::audit::Report {
-        let inputs: Vec<valu::audit::AuditInput> = self
+    fn security_report(&self) -> keypal::audit::Report {
+        let inputs: Vec<keypal::audit::AuditInput> = self
             .rows
             .iter()
-            .map(|r| valu::audit::AuditInput {
+            .map(|r| keypal::audit::AuditInput {
                 id: r.id,
                 name: &r.name,
                 password: &r.password,
@@ -2205,7 +2205,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        valu::audit::audit(&inputs, now)
+        keypal::audit::audit(&inputs, now)
     }
 
     /// Left pane: tag filters with counts, and the health summary.
@@ -3492,7 +3492,7 @@ impl App {
                     );
                     if ui.button("Load").clicked() {
                         let path = self.text_path.trim().to_string();
-                        match valu::import::read_text_file(std::path::Path::new(&path)) {
+                        match keypal::import::read_text_file(std::path::Path::new(&path)) {
                             Ok(text) => {
                                 // Appended, never overwritten: silently
                                 // replacing whatever the user had already typed
@@ -3790,7 +3790,7 @@ impl App {
         };
         let result = (|| -> Result<(String, usize), String> {
             let text = std::fs::read_to_string(&path).map_err(|_| "cannot read that file")?;
-            let (source, rows) = valu::import::parse(&text).map_err(|e| e.to_string())?;
+            let (source, rows) = keypal::import::parse(&text).map_err(|e| e.to_string())?;
             for r in &rows {
                 db.insert_entry_full(
                     session, &r.name, &r.username, &r.password,
@@ -3870,7 +3870,7 @@ impl App {
     fn do_backup(&mut self) {
         let Some(path) = self.vault_path.clone() else { return };
         let Some(db) = self.db.as_ref() else { return };
-        match valu::export::backup(&path, db.conn()) {
+        match keypal::export::backup(&path, db.conn()) {
             Ok(target) => {
                 db.log_access(None, "backup");
                 self.set(format!("Backup written to {}", target.display()), Level::Ok);
@@ -3884,10 +3884,10 @@ impl App {
         if target.is_empty() {
             return self.set("Choose where to write the CSV", Level::Bad);
         }
-        let rows: Vec<valu::export::Outgoing> = self
+        let rows: Vec<keypal::export::Outgoing> = self
             .rows
             .iter()
-            .map(|r| valu::export::Outgoing {
+            .map(|r| keypal::export::Outgoing {
                 name: r.name.clone(),
                 username: r.username.clone(),
                 password: r.password.clone(),
@@ -3898,8 +3898,8 @@ impl App {
             })
             .collect();
         let n = rows.len();
-        let csv = valu::export::to_csv(&rows);
-        match valu::export::write_csv(std::path::Path::new(&target), &csv) {
+        let csv = keypal::export::to_csv(&rows);
+        match keypal::export::write_csv(std::path::Path::new(&target), &csv) {
             Ok(()) => {
                 if let Some(db) = self.db.as_ref() {
                     db.log_access(None, "export_csv");

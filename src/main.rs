@@ -1,4 +1,4 @@
-//! # VALU — CLI entrypoint & lifecycle orchestration
+//! # Keypal — CLI entrypoint & lifecycle orchestration
 //!
 //! Startup sequence (order matters for security):
 //!   1. `harden_process_memory()` — mlockall + RLIMIT_CORE=0 **before** any secret exists.
@@ -7,17 +7,17 @@
 
 use rand_core::{OsRng, RngCore};
 use rusqlite::params;
-use valu::circuit_breaker::{BreakerConfig, CircuitBreaker};
-use valu::storage::SecretStore;
-use valu::key_lifecycle::{KeySession, MasterKey};
-use valu::redaction;
-use valu::storage::secure_erase;
-use valu::storage::VaultDatabase;
+use keypal::circuit_breaker::{BreakerConfig, CircuitBreaker};
+use keypal::storage::SecretStore;
+use keypal::key_lifecycle::{KeySession, MasterKey};
+use keypal::redaction;
+use keypal::storage::secure_erase;
+use keypal::storage::VaultDatabase;
 use std::path::PathBuf;
 
 fn main() {
     // ── 1. Memory hardening FIRST (no secrets allocated yet) ────────────────────
-    if let Err(e) = valu::secure_mem::harden_process_memory() {
+    if let Err(e) = keypal::secure_mem::harden_process_memory() {
         eprintln!("[WARN] {e}");
         // Continue in degraded mode but loudly warn — user must know swap risk exists.
     }
@@ -25,7 +25,7 @@ fn main() {
     // ── 2. Logging with strict redaction ────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "valu=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "keypal=info".into()),
         )
         .init();
 
@@ -40,15 +40,15 @@ fn main() {
         Some("import-kdbx")     => cmd_import_kdbx(&args[1..]),
         Some("destroy")         => cmd_destroy(&args[1..]),
         _ => {
-            eprintln!("VALU — SOTA Privacy-First Password Vault");
+            eprintln!("Keypal — SOTA Privacy-First Password Vault");
             eprintln!("Usage:");
-            eprintln!("  valu create-volatile <path>          Create ephemeral vault (key never touches disk)");
-            eprintln!("  valu create <path> <passphrase>      Create passphrase-mode vault (key re-derivable)");
-            eprintln!("  valu get <path> <passphrase> <name>  Look up an entry by name");
-            eprintln!("  valu serve <path> <passphrase>        Serve secrets over D-Bus (org.rafa.Valu1)");
-            eprintln!("  valu add <path> <passphrase> <name> <username> <password> Add an entry");
-            eprintln!("  valu import-kdbx <valu-path> <valu-passphrase> <kdbx-path> <kdbx-password> Import entries from a KDBX file");
-            eprintln!("  valu destroy <path>                  Secure Erase Protocol (wipe key + WAL truncate + VACUUM)");
+            eprintln!("  keypal create-volatile <path>          Create ephemeral vault (key never touches disk)");
+            eprintln!("  keypal create <path> <passphrase>      Create passphrase-mode vault (key re-derivable)");
+            eprintln!("  keypal get <path> <passphrase> <name>  Look up an entry by name");
+            eprintln!("  keypal serve <path> <passphrase>        Serve secrets over D-Bus (org.rafa.Valu1)");
+            eprintln!("  keypal add <path> <passphrase> <name> <username> <password> Add an entry");
+            eprintln!("  keypal import-kdbx <vault-path> <vault-passphrase> <kdbx-path> <kdbx-password> Import entries from a KDBX file");
+            eprintln!("  keypal destroy <path>                  Secure Erase Protocol (wipe key + WAL truncate + VACUUM)");
         }
     }
 }
@@ -94,7 +94,7 @@ fn cmd_create_volatile(args: &[String]) {
 /// re-derived in later processes.
 fn cmd_create(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("Usage: valu create <path> <passphrase>");
+        eprintln!("Usage: keypal create <path> <passphrase>");
         return;
     }
     let path = vault_path(args);
@@ -119,7 +119,7 @@ fn cmd_create(args: &[String]) {
 
     // Persist the circuit-breaker state (sealed under breaker_key, derived from the
     // public salt) so lockouts survive restarts without needing the passphrase.
-    let breaker_key = valu::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
+    let breaker_key = keypal::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
     let cb = CircuitBreaker::new(BreakerConfig::default());
     let sealed = cb.seal_state(&breaker_key);
     db.conn().execute(
@@ -134,7 +134,7 @@ fn cmd_create(args: &[String]) {
 /// Look up an entry by name in a passphrase-mode vault and print username + password.
 fn cmd_get(args: &[String]) {
     if args.len() < 3 {
-        eprintln!("Usage: valu get <path> <passphrase> <entry-name>");
+        eprintln!("Usage: keypal get <path> <passphrase> <entry-name>");
         return;
     }
     let path = vault_path(&args);
@@ -150,7 +150,7 @@ fn cmd_get(args: &[String]) {
 
     // 2b. Circuit breaker: derive its key from the public salt (readable WITHOUT the
     // passphrase), unseal the persisted state, and gate the attempt BEFORE any key work.
-    let breaker_key = valu::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
+    let breaker_key = keypal::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
     let mut breaker = match conn.query_row(
         "SELECT value FROM meta WHERE key='breaker'", [], |r| r.get::<_, Vec<u8>>(0)
     ) {
@@ -247,7 +247,7 @@ fn cmd_get(args: &[String]) {
 /// that depends on it.
 fn cmd_serve(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("Usage: valu serve <path> <passphrase>");
+        eprintln!("Usage: keypal serve <path> <passphrase>");
         return;
     }
     let path = vault_path(&args);
@@ -260,7 +260,7 @@ fn cmd_serve(args: &[String]) {
         .expect("salt present (run create first)");
 
     // 2. Load the breaker exactly as cmd_get does.
-    let breaker_key = valu::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
+    let breaker_key = keypal::crypto::kdf::hkdf_domain(&salt, b"valu/breaker/v1");
     let breaker = match conn.query_row(
         "SELECT value FROM meta WHERE key='breaker'",
         [],
@@ -284,7 +284,7 @@ fn cmd_serve(args: &[String]) {
     };
 
     // 3. Build the service.
-    let iface = valu::dbus::SecretService::new(db, session, breaker, breaker_key, conn);
+    let iface = keypal::dbus::SecretService::new(db, session, breaker, breaker_key, conn);
 
     // 4. Build the connection and serve the interface at /org/rafa/Valu1.
     let _conn = zbus::blocking::connection::Builder::session()
@@ -306,7 +306,7 @@ fn cmd_serve(args: &[String]) {
 /// Add an entry to an existing vault (requires a passphrase-mode vault for persistence).
 fn cmd_add(args: &[String]) {
     if args.len() < 5 {
-        eprintln!("Usage: valu add <path> <passphrase> <name> <username> <password>");
+        eprintln!("Usage: keypal add <path> <passphrase> <name> <username> <password>");
         return;
     }
     let path = vault_path(&args);
@@ -339,13 +339,13 @@ fn cmd_add(args: &[String]) {
 // would require the crate to expose zeroizing accessors.
 fn cmd_import_kdbx(args: &[String]) {
     if args.len() < 4 {
-        eprintln!("Usage: valu import-kdbx <valu-path> <valu-passphrase> <kdbx-path> <kdbx-password>");
+        eprintln!("Usage: keypal import-kdbx <vault-path> <vault-passphrase> <kdbx-path> <kdbx-password>");
         return;
     }
     let path = vault_path(&args);
     let (passphrase, kdbx_path, kdbx_password) = (&args[1], &args[2], &args[3]);
 
-    // Open the VALU vault: salt row + MasterKey::unlock_passphrase (same path as cmd_get).
+    // Open the Keypal vault: salt row + MasterKey::unlock_passphrase (same path as cmd_get).
     let conn = rusqlite::Connection::open(path.to_str().unwrap()).expect("db open");
     let salt: Vec<u8> = conn.query_row(
         "SELECT value FROM meta WHERE key='argon_salt'", [], |r| r.get(0)
@@ -395,7 +395,7 @@ fn cmd_import_kdbx(args: &[String]) {
 /// Execute the Secure Erase Protocol and destroy all key material.
 fn cmd_destroy(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("Usage: valu destroy <path> <passphrase>");
+        eprintln!("Usage: keypal destroy <path> <passphrase>");
         return;
     }
     let path = vault_path(&args);

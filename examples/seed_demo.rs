@@ -17,9 +17,9 @@
 //!     KEYPAL_SHOT_KIND=13 ./target/release/keypal-gui
 
 use rand_core::{OsRng, RngCore};
-use valu::key_lifecycle::{KeySession, MasterKey};
-use valu::kind::{encode_fields, Kind};
-use valu::storage::{EntryDraft, VaultDatabase};
+use keypal::key_lifecycle::{KeySession, MasterKey};
+use keypal::kind::{encode_fields, Kind};
+use keypal::storage::{EntryDraft, VaultDatabase};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap();

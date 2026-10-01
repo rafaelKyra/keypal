@@ -25,9 +25,16 @@
 //!   - `wipe_key` — Secure Erase Protocol key (Phase 2)
 //! This ensures a leak of one domain never compromises the others.
 
+// ── On-disk format identifiers: do not rename ───────────────────────────────
+// The HKDF domain-separation labels below ("valu/enc/v1", "valu/mac/v1",
+// "valu/wipe/v1", "valu/keyfile/v1") and the breaker label elsewhere
+// ("valu/breaker/v1") date from this project's former name. They are inputs to
+// key derivation, so changing any of them changes every derived key and makes
+// existing vaults unreadable. Renaming them is a format break, not a cleanup.
+
 use crate::crypto::kdf;
 use crate::secure_mem::SecureBuffer;
-use crate::ValuError;
+use crate::KeypalError;
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroize;
 
@@ -67,11 +74,11 @@ impl MasterKey {
     // ── Volatile Mode ────────────────────────────────────────────────────────
 
     /// Generate a fresh ephemeral master key. **No disk I/O.**
-    pub fn create_volatile() -> Result<Self, ValuError> {
+    pub fn create_volatile() -> Result<Self, KeypalError> {
         let mut raw = SecureBuffer::new_zeroed(32);
         let mut rng = OsRng;
         rng.try_fill_bytes(raw.as_mut_bytes())
-            .map_err(|e| ValuError::KeyLifecycle(format!("CSPRNG fill failed: {e}")))?; // CSPRNG into mlocked RAM
+            .map_err(|e| KeypalError::KeyLifecycle(format!("CSPRNG fill failed: {e}")))?; // CSPRNG into mlocked RAM
         Ok(Self { mode: KeyMode::Volatile, raw })
     }
 
@@ -79,7 +86,7 @@ impl MasterKey {
 
     /// Derive a master key from a passphrase via Argon2id.
     /// The passphrase is zeroized immediately after use and never stored.
-    pub fn create_passphrase(pass: &str, salt: &[u8]) -> Result<Self, ValuError> {
+    pub fn create_passphrase(pass: &str, salt: &[u8]) -> Result<Self, KeypalError> {
         let policy = ArgonPolicy::sota();
         // KDF output lands directly in a secure buffer; the intermediate `Vec` from
         // argon2 is zeroed before return (see crypto::kdf).
@@ -110,7 +117,7 @@ impl MasterKey {
         pass: &str,
         salt: &[u8],
         keyfile_bytes: &[u8],
-    ) -> Result<Self, ValuError> {
+    ) -> Result<Self, KeypalError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"valu/keyfile/v1");
@@ -137,7 +144,7 @@ impl MasterKey {
     }
 
     /// Re-derive from an existing salt — used at unlock time.
-    pub fn unlock_passphrase(pass: &str, salt: &[u8]) -> Result<Self, ValuError> {
+    pub fn unlock_passphrase(pass: &str, salt: &[u8]) -> Result<Self, KeypalError> {
         Self::create_passphrase(pass, salt)
     }
 

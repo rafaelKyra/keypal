@@ -1,4 +1,4 @@
-//! # VALU — SOTA Privacy-First Password Vault (Linux)
+//! # Keypal — SOTA Privacy-First Password Vault (Linux)
 //!
 //! Crate root. Module map:
 //!
@@ -24,7 +24,7 @@ pub mod storage;
 
 /// Crate-wide error type.
 #[derive(Debug, thiserror::Error)]
-pub enum ValuError {
+pub enum KeypalError {
     #[error("secure memory: {0}")]
     SecureMem(String),
     #[error("key lifecycle: {0}")]
@@ -37,4 +37,4 @@ pub enum ValuError {
     Crypto(String),
 }
 
-pub type Result<T> = std::result::Result<T, ValuError>;
+pub type Result<T> = std::result::Result<T, KeypalError>;

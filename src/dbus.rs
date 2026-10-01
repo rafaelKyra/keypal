@@ -1,9 +1,9 @@
-//! # VALU — D-Bus service (org.rafa.Valu1)
+//! # Keypal — D-Bus service (org.rafa.Valu1)
 //!
 //! A minimal, deliberately non-standard D-Bus interface. We do NOT implement
 //! org.freedesktop.secrets: that well-known name belongs to gnome-keyring on
 //! this machine, and taking it would break every application that depends on
-//! it. Clients that want VALU must talk to org.rafa.Valu1 explicitly.
+//! it. Clients that want Keypal must talk to org.rafa.Valu1 explicitly.
 //!
 //! `rusqlite::Connection` and `VaultDatabase` are not `Sync`, but the
 //! `#[zbus::interface]` macro requires the served struct to be `Sync` (its

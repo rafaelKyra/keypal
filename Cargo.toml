@@ -1,14 +1,16 @@
 [package]
-name = "valu"
+name = "keypal"
 version = "1.0.0"
 edition = "2021"
-description = "SOTA privacy-first password vault for Linux (KDBX4-compatible core, rafa.ai-inspired ephemeral key lifecycle)"
-license = "MIT"
+description = "Keypal — offline vault for passwords, keys, cards and notes"
+license = "Apache-2.0"
+authors = ["Rafael Kyra"]
+repository = "https://github.com/rafaelKyra/keypal"
 
 # ---------------------------------------------------------------------------
-# VALU — workspace layout
+# Keypal — workspace layout
 #
-#   valu/
+#   keypal/
 #     Cargo.toml                 <- this file
 #     ARCHITECTURE.md            <- threat model + key-lifecycle docs (Phase 1)
 #     src/

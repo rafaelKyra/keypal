@@ -43,7 +43,7 @@ pub struct VaultDatabase {
 impl VaultDatabase {
     /// Open (or create) a vault at `path`. The DB file contains **only ciphertext** —
     /// every secret column is AEAD-encrypted under the session's enc_key before insert.
-    pub fn open(path: &str, _session: &KeySession) -> Result<Self, crate::ValuError> {
+    pub fn open(path: &str, _session: &KeySession) -> Result<Self, crate::KeypalError> {
         let conn = Connection::open(path)?;
 
         // ── Privacy hardening pragmas (prevent plaintext leakage to temp/journal) ──
@@ -141,7 +141,7 @@ impl VaultDatabase {
         password: &str,
         uri: Option<&str>,
         totp_secret: Option<&str>,
-    ) -> Result<i64, crate::ValuError> {
+    ) -> Result<i64, crate::KeypalError> {
         let key = session.enc_key();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -185,7 +185,7 @@ impl VaultDatabase {
         &self,
         session: &KeySession,
         id: i64,
-    ) -> Result<Option<Entry>, crate::ValuError> {
+    ) -> Result<Option<Entry>, crate::KeypalError> {
         let key = session.enc_key();
         let row = self.conn.query_row(
             "SELECT name_enc, user_enc, pass_enc, uri_enc, totp_secret, nonce, \
@@ -229,7 +229,7 @@ impl VaultDatabase {
         // carry 8 (96). Accepting all three is what lets an existing vault open
         // after the upgrade instead of reporting corruption.
         if !matches!(nonce_b.len(), 60 | 84 | 96) {
-            return Err(crate::ValuError::Crypto(format!(
+            return Err(crate::KeypalError::Crypto(format!(
                 "bad nonce blob: expected 60, 84 or 96 bytes, got {}",
                 nonce_b.len()
             )));
@@ -241,11 +241,11 @@ impl VaultDatabase {
         let totp_nonce: [u8; 12] = nonce_b[48..60].try_into().unwrap();
 
         let name = String::from_utf8(aead::decrypt(self.cipher, key, &name_nonce, &name_ct)?)
-            .map_err(|e| crate::ValuError::Crypto(format!("name not UTF-8: {e}")))?;
+            .map_err(|e| crate::KeypalError::Crypto(format!("name not UTF-8: {e}")))?;
         let username = String::from_utf8(aead::decrypt(self.cipher, key, &user_nonce, &user_ct)?)
-            .map_err(|e| crate::ValuError::Crypto(format!("username not UTF-8: {e}")))?;
+            .map_err(|e| crate::KeypalError::Crypto(format!("username not UTF-8: {e}")))?;
         let password = String::from_utf8(aead::decrypt(self.cipher, key, &pass_nonce, &pass_ct)?)
-            .map_err(|e| crate::ValuError::Crypto(format!("password not UTF-8: {e}")))?;
+            .map_err(|e| crate::KeypalError::Crypto(format!("password not UTF-8: {e}")))?;
         let uri = uri_ct
             .map(|c| aead::decrypt(self.cipher, key, &uri_nonce, &c))
             .transpose()?
@@ -323,7 +323,7 @@ impl VaultDatabase {
         password: &str,
         uri: Option<&str>,
         totp_secret: Option<&str>,
-    ) -> Result<bool, crate::ValuError> {
+    ) -> Result<bool, crate::KeypalError> {
         use rand_core::{OsRng, RngCore};
 
         let key = session.enc_key();
@@ -375,7 +375,7 @@ impl VaultDatabase {
         totp_secret: Option<&str>,
         notes: Option<&str>,
         tags: Option<&str>,
-    ) -> Result<i64, crate::ValuError> {
+    ) -> Result<i64, crate::KeypalError> {
         self.insert_draft(
             session,
             &EntryDraft {
@@ -396,7 +396,7 @@ impl VaultDatabase {
         &self,
         session: &KeySession,
         draft: &EntryDraft<'_>,
-    ) -> Result<i64, crate::ValuError> {
+    ) -> Result<i64, crate::KeypalError> {
         let id = self.insert_entry(
             session,
             draft.name,
@@ -435,7 +435,7 @@ impl VaultDatabase {
         totp_secret: Option<&str>,
         notes: Option<&str>,
         tags: Option<&str>,
-    ) -> Result<bool, crate::ValuError> {
+    ) -> Result<bool, crate::KeypalError> {
         let existing = self.get_entry(session, id)?;
         let kind = existing.as_ref().map(|e| e.kind).unwrap_or_default();
         let fields = existing
@@ -465,7 +465,7 @@ impl VaultDatabase {
         session: &KeySession,
         id: i64,
         draft: &EntryDraft<'_>,
-    ) -> Result<bool, crate::ValuError> {
+    ) -> Result<bool, crate::KeypalError> {
         use rand_core::{OsRng, RngCore};
 
         let EntryDraft { name, username, password, uri, totp_secret, notes, tags, kind, fields } =
@@ -550,7 +550,7 @@ impl VaultDatabase {
         &self,
         session: &KeySession,
         entry_id: i64,
-    ) -> Result<Vec<(i64, String, Option<String>)>, crate::ValuError> {
+    ) -> Result<Vec<(i64, String, Option<String>)>, crate::KeypalError> {
         let key = session.enc_key();
         let mut stmt = self.conn.prepare(
             // `id DESC` breaks ties: two edits in the same second share a
@@ -590,7 +590,7 @@ impl VaultDatabase {
     }
 
     /// Recent access events, newest first.
-    pub fn recent_access(&self, limit: i64) -> Result<Vec<(i64, Option<i64>, String)>, crate::ValuError> {
+    pub fn recent_access(&self, limit: i64) -> Result<Vec<(i64, Option<i64>, String)>, crate::KeypalError> {
         let mut stmt = self.conn.prepare(
             "SELECT at, entry_id, action FROM access_log ORDER BY at DESC, id DESC LIMIT ?1",
         )?;
@@ -617,7 +617,7 @@ impl VaultDatabase {
     ///
     /// History and access-log rows for the entry go too: leaving them would
     /// keep old passwords for something the user was told is gone.
-    pub fn purge_entry(&self, session: &KeySession, id: i64) -> Result<bool, crate::ValuError> {
+    pub fn purge_entry(&self, session: &KeySession, id: i64) -> Result<bool, crate::KeypalError> {
         use rand_core::{OsRng, RngCore};
 
         let exists: bool = self
@@ -636,7 +636,7 @@ impl VaultDatabase {
         // Random payloads, not zeros: a run of identical ciphertexts would say
         // "this row was shredded", and how many were.
         let mut junk = [0u8; 48];
-        let mut blob = |i: usize| -> Result<Vec<u8>, crate::ValuError> {
+        let mut blob = |i: usize| -> Result<Vec<u8>, crate::KeypalError> {
             OsRng.fill_bytes(&mut junk);
             aead::encrypt(self.cipher, wipe, &nonces[i], junk.to_vec())
         };
@@ -685,7 +685,7 @@ impl VaultDatabase {
     }
 
     /// Set or clear an expiry date, for rotation reminders.
-    pub fn set_expiry(&self, id: i64, at: Option<i64>) -> Result<bool, crate::ValuError> {
+    pub fn set_expiry(&self, id: i64, at: Option<i64>) -> Result<bool, crate::KeypalError> {
         let n = self.conn.execute(
             "UPDATE entries SET expires_at=?2 WHERE id=?1",
             rusqlite::params![id, at],
@@ -709,7 +709,7 @@ impl VaultDatabase {
             .unwrap_or(0)
     }
 
-    pub fn set_retention_days(&self, days: i64) -> Result<(), crate::ValuError> {
+    pub fn set_retention_days(&self, days: i64) -> Result<(), crate::KeypalError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('trash_retention_days', ?1)",
             rusqlite::params![days.max(0).to_string().into_bytes()],
@@ -730,7 +730,7 @@ impl VaultDatabase {
         &self,
         session: &KeySession,
         now: i64,
-    ) -> Result<usize, crate::ValuError> {
+    ) -> Result<usize, crate::KeypalError> {
         let days = self.retention_days();
         if days <= 0 {
             return Ok(0);
@@ -756,7 +756,7 @@ impl VaultDatabase {
     pub fn list_trashed(
         &self,
         session: &KeySession,
-    ) -> Result<Vec<(i64, Entry)>, crate::ValuError> {
+    ) -> Result<Vec<(i64, Entry)>, crate::KeypalError> {
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM entries WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC")?;
@@ -774,7 +774,7 @@ impl VaultDatabase {
     }
 
     /// Move an entry to the trash. Reversible; `purge_entry` is not.
-    pub fn trash_entry(&self, id: i64) -> Result<bool, crate::ValuError> {
+    pub fn trash_entry(&self, id: i64) -> Result<bool, crate::KeypalError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -785,13 +785,13 @@ impl VaultDatabase {
         Ok(n > 0)
     }
 
-    pub fn restore_entry(&self, id: i64) -> Result<bool, crate::ValuError> {
+    pub fn restore_entry(&self, id: i64) -> Result<bool, crate::KeypalError> {
         let n = self.conn.execute("UPDATE entries SET deleted_at=NULL WHERE id=?1", [id])?;
         Ok(n > 0)
     }
 
     /// Mark or unmark a favourite.
-    pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<bool, crate::ValuError> {
+    pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<bool, crate::KeypalError> {
         let n = self.conn.execute(
             "UPDATE entries SET favorite=?2 WHERE id=?1",
             rusqlite::params![id, i64::from(favorite)],
@@ -807,7 +807,7 @@ impl VaultDatabase {
     pub fn list_entries(
         &self,
         session: &KeySession,
-    ) -> Result<Vec<(i64, Entry)>, crate::ValuError> {
+    ) -> Result<Vec<(i64, Entry)>, crate::KeypalError> {
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM entries WHERE deleted_at IS NULL ORDER BY id")?;
@@ -834,12 +834,12 @@ impl VaultDatabase {
     /// file. That is acceptable because the value was never plaintext on disk
     /// — and it is exactly why `secure_erase` exists separately for the case
     /// where the whole vault must become unrecoverable.
-    pub fn delete_entry(&self, id: i64) -> Result<bool, crate::ValuError> {
+    pub fn delete_entry(&self, id: i64) -> Result<bool, crate::KeypalError> {
         let n = self.conn.execute("DELETE FROM entries WHERE id=?1", [id])?;
         Ok(n > 0)
     }
 
-    pub fn entry_count(&self) -> Result<i64, crate::ValuError> {
+    pub fn entry_count(&self) -> Result<i64, crate::KeypalError> {
         self.conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).map_err(Into::into)
     }
 
@@ -931,7 +931,7 @@ pub trait SecretStore {
 }
 
 impl SecretStore for VaultDatabase {
-    type Error = crate::ValuError;
+    type Error = crate::KeypalError;
 
     fn entry_by_name(
         &self,
