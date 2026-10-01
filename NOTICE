@@ -1,0 +1,24 @@
+Keypal
+Copyright 2026 Rafael Kyra
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Not licensed under the Apache License
+-------------------------------------
+The name "Keypal" and the mascot image (assets/mascot.png) are the property of
+the copyright holder. As Section 6 of the Apache License states, the license
+does not grant permission to use the name, trademarks or branding of the
+Licensor except as required to describe the origin of the Work. Forks and
+derivative works should use their own name and artwork.
+
+Third-party material included in this repository
+------------------------------------------------
+assets/mono.ttf is DejaVu Sans Mono. Its license (Bitstream Vera / DejaVu) is
+reproduced in assets/LICENSE-DejaVu.txt and must accompany any redistribution
+of the font.
+
+Binary distributions additionally embed the fonts shipped by the Rust crate
+epaint_default_fonts (licensed MIT OR Apache-2.0, with OFL-1.1 and the Ubuntu
+Font Licence for the font files) and statically link the dependencies listed
+in Cargo.lock, each under its own license. A binary release must carry their
+notices; this source repository does not redistribute them.

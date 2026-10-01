@@ -1,12 +1,30 @@
-# VALU — SOTA Privacy-First Password Vault (Linux)
+# Keypal — Architecture & Threat Model
 
-**Architecture & Threat Model — Phase 1 + Phase 2**
+**Design document — Phase 1 + Phase 2**
+
+
+> **Status note (v1.0.0).** This is the original design document, written when the
+> project was called VALU. It describes intent as well as fact, and parts of it are
+> out of date. Checked against the source at this commit:
+>
+> - **Implemented:** encrypted vault with per-field AEAD (AES-256-GCM and
+>   ChaCha20-Poly1305), Argon2id + HKDF-SHA256, mlock-backed secret buffers, secure
+>   erase, unlock circuit breaker, log redaction, TOTP (RFC 6238), CSV import and
+>   export, **KeePass (KDBX) import**, a D-Bus service (`keypal serve`), a CLI and an
+>   egui desktop application.
+> - **Not implemented**, although the text below mentions them: auto-type,
+>   hardware-token hooks, a browser extension, sync, and writing KDBX files.
+> - **"Future Phases" (section 8)** is partly done: KDBX import, the D-Bus service
+>   and the GUI exist; the rest has not been started.
+> - **Legacy identifiers kept on purpose:** the HKDF labels `valu/...`, the D-Bus
+>   name `org.rafa.Valu1` and the `.local/share/valu` path. They are on-disk or
+>   runtime identifiers; changing them would make existing vaults unreadable.
 
 ---
 
 ## 1. Design Philosophy
 
-VALU combines the robust feature set of KeePassXC (KDBX4-compatible format, hardware-token hooks, auto-type) with the radical privacy and ephemeral key-management concepts of rafa.ai:
+Keypal set out to combine the feature set of KeePassXC (KDBX4 compatibility, hardware-token hooks, auto-type — goals, not implemented; see the status note above) with the radical privacy and ephemeral key-management concepts of rafa.ai:
 
 - **Memory-safe core**: Rust end-to-end; no C++ FFI except `libc` for `mlockall`.
 - **Zero plaintext at rest**: every secret column is AEAD-encrypted (AES-256-GCM or ChaCha20-Poly1305) before it touches SQLite.
