@@ -13,10 +13,10 @@ use eframe::egui;
 use rand_core::{OsRng, RngCore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use keypal::key_lifecycle::{KeySession, MasterKey};
-use keypal::kind::{self, Kind};
-use keypal::storage::{EntryDraft, VaultDatabase};
-use keypal::totp;
+use vaultling::key_lifecycle::{KeySession, MasterKey};
+use vaultling::kind::{self, Kind};
+use vaultling::storage::{EntryDraft, VaultDatabase};
+use vaultling::totp;
 
 // ── Palette ─────────────────────────────────────────────────────────────────
 //
@@ -290,7 +290,7 @@ impl Default for App {
             csv_path: String::new(),
             export_path: portable_root()
                 .unwrap_or_else(home)
-                .join("keypal-export.csv")
+                .join("vaultling-export.csv")
                 .display()
                 .to_string(),
             keyfile_path: String::new(),
@@ -357,7 +357,7 @@ fn home() -> PathBuf {
 
 /// True when the application is running as a portable install.
 ///
-/// Marked by a `.keypal-portable` file beside the executable, which is the only
+/// Marked by a `.vaultling-portable` file beside the executable, which is the only
 /// signal that cannot be faked by where the user happens to have launched from.
 /// In portable mode nothing outside the medium is read or written: the point of
 /// carrying a vault on a stick is that the machine you plug it into keeps no
@@ -365,7 +365,9 @@ fn home() -> PathBuf {
 fn portable_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
-    if dir.join(".keypal-portable").exists() {
+    // ".keypal-portable" is the marker earlier portable installs carry; honouring it
+    // keeps them in portable mode instead of silently scanning $HOME.
+    if dir.join(".vaultling-portable").exists() || dir.join(".keypal-portable").exists() {
         Some(dir)
     } else {
         None
@@ -427,7 +429,7 @@ fn looks_like_vault(path: &Path) -> bool {
 fn read_salt(path: &Path) -> Result<Vec<u8>, String> {
     let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
     conn.query_row("SELECT value FROM meta WHERE key='argon_salt'", [], |r| r.get(0))
-        .map_err(|_| "not a Keypal vault, or it has no salt".to_string())
+        .map_err(|_| "not a Vaultling vault, or it has no salt".to_string())
 }
 
 /// 20 characters from a 69-symbol alphabet ≈ 122 bits.
@@ -915,14 +917,14 @@ impl App {
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "keypal-mono".to_owned(),
+        "vaultling-mono".to_owned(),
         egui::FontData::from_static(include_bytes!("../../assets/mono.ttf")),
     );
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "keypal-mono".to_owned());
+        .insert(0, "vaultling-mono".to_owned());
     ctx.set_fonts(fonts);
 }
 
@@ -1866,7 +1868,7 @@ impl eframe::App for App {
 
         // ── Design feedback loop ────────────────────────────────────────────
         //
-        // KEYPAL_SHOT=<path> makes the window photograph itself: F12 (or the
+        // VAULTLING_SHOT=<path> makes the window photograph itself: F12 (or the
         // env var alone, on the first frames) asks egui for the framebuffer and
         // writes a PNG. Wayland refuses X11 screen capture, so without this the
         // only way to see the interface is to ask the user for a screenshot —
@@ -1884,31 +1886,31 @@ impl eframe::App for App {
             self.shot_requested = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
-        if let Some(path) = std::env::var("KEYPAL_SHOT").ok().filter(|p| !p.is_empty()) {
+        if let Some(path) = std::env::var("VAULTLING_SHOT").ok().filter(|p| !p.is_empty()) {
             // Optionally open a vault first, so the screens behind the lock can
-            // be photographed too. Only ever reached with KEYPAL_SHOT set.
+            // be photographed too. Only ever reached with VAULTLING_SHOT set.
             if self.shot_countdown == 8 {
                 // Outside the unlock block: the browser lives on the LOCK
                 // screen, which is what you get when no vault is given.
-                if std::env::var("KEYPAL_SHOT_BROWSE").is_ok() {
+                if std::env::var("VAULTLING_SHOT_BROWSE").is_ok() {
                     self.file_browser = true;
                     self.browse_dir = home();
                 }
                 if let (Ok(v), Ok(pw)) =
-                    (std::env::var("KEYPAL_SHOT_VAULT"), std::env::var("KEYPAL_SHOT_PASS"))
+                    (std::env::var("VAULTLING_SHOT_VAULT"), std::env::var("VAULTLING_SHOT_PASS"))
                 {
-                    // KEYPAL_SHOT_LIGHT=1 photographs the light theme. Colour
+                    // VAULTLING_SHOT_LIGHT=1 photographs the light theme. Colour
                     // chosen per theme is exactly the kind of thing that goes
                     // wrong in only one of them, and stays wrong because only
                     // the other one is ever looked at.
-                    if std::env::var("KEYPAL_SHOT_LIGHT").is_ok() {
+                    if std::env::var("VAULTLING_SHOT_LIGHT").is_ok() {
                         self.light = true;
                         apply_theme(ctx, true);
                     }
                     self.manual_path = v;
                     self.passphrase = pw;
                     self.unlock();
-                    if let Ok(panel) = std::env::var("KEYPAL_SHOT_PANEL") {
+                    if let Ok(panel) = std::env::var("VAULTLING_SHOT_PANEL") {
                         self.panel = match panel.as_str() {
                             "editor" => Panel::Editor,
                             "import" => Panel::ImportCsv,
@@ -1918,12 +1920,12 @@ impl eframe::App for App {
                             "trash" => Panel::Trash,
                             _ => Panel::List,
                         };
-                        // KEYPAL_SHOT_KIND=<number> picks a category: which
+                        // VAULTLING_SHOT_KIND=<number> picks a category: which
                         // form the editor shows, and which entry the detail
                         // pane opens. Without it only the default form can be
                         // seen, and sixteen forms that nobody can look at are
                         // sixteen forms nobody has checked.
-                        let want = std::env::var("KEYPAL_SHOT_KIND")
+                        let want = std::env::var("VAULTLING_SHOT_KIND")
                             .ok()
                             .and_then(|k| k.trim().parse::<i64>().ok())
                             .map(Kind::from_i64);
@@ -1936,18 +1938,18 @@ impl eframe::App for App {
                                 self.kind_filter = Some(k);
                             }
                         }
-                        // KEYPAL_SHOT_SEARCH=<text> types into the search box.
-                        if let Ok(q) = std::env::var("KEYPAL_SHOT_SEARCH") {
+                        // VAULTLING_SHOT_SEARCH=<text> types into the search box.
+                        if let Ok(q) = std::env::var("VAULTLING_SHOT_SEARCH") {
                             self.filter = q;
                         }
                         if panel == "detail" {
                             let row = self.rows.iter().find(|r| want.is_none_or(|k| r.kind == k));
                             self.open_entry = row.map(|r| r.id);
-                            // KEYPAL_SHOT_REVEAL=1 opens every hidden field, so
+                            // VAULTLING_SHOT_REVEAL=1 opens every hidden field, so
                             // the revealed layout can be checked too — it is
                             // the state a masked field is never photographed in
                             // and therefore the one that breaks unnoticed.
-                            if std::env::var("KEYPAL_SHOT_REVEAL").is_ok() {
+                            if std::env::var("VAULTLING_SHOT_REVEAL").is_ok() {
                                 self.reveal_password = true;
                                 self.reveal_notes = true;
                                 if let Some(r) = row {
@@ -2186,11 +2188,11 @@ impl App {
         });
     }
 
-    fn security_report(&self) -> keypal::audit::Report {
-        let inputs: Vec<keypal::audit::AuditInput> = self
+    fn security_report(&self) -> vaultling::audit::Report {
+        let inputs: Vec<vaultling::audit::AuditInput> = self
             .rows
             .iter()
-            .map(|r| keypal::audit::AuditInput {
+            .map(|r| vaultling::audit::AuditInput {
                 id: r.id,
                 name: &r.name,
                 password: &r.password,
@@ -2205,7 +2207,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        keypal::audit::audit(&inputs, now)
+        vaultling::audit::audit(&inputs, now)
     }
 
     /// Left pane: tag filters with counts, and the health summary.
@@ -2398,7 +2400,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(1.0);
                 ui.label(
-                    egui::RichText::new("Keypal")
+                    egui::RichText::new("Vaultling")
                         .size(21.0)
                         .strong()
                         .color(pal().text),
@@ -2449,7 +2451,7 @@ impl App {
         ui.vertical_centered(|ui| {
             logo(ui, 52.0);
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Keypal").size(26.0).strong().color(pal().text));
+            ui.label(egui::RichText::new("Vaultling").size(26.0).strong().color(pal().text));
             ui.add_space(3.0);
             ui.label(
                 egui::RichText::new("Your keys and passwords, kept on this machine and nowhere else")
@@ -2674,7 +2676,7 @@ impl App {
                         let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
                         let vault = looks_like_vault(&f);
                         let kb = std::fs::metadata(&f).map(|m| (m.len() / 1024) as usize).unwrap_or(0);
-                        // A .db that is not a Keypal vault is still listed, but
+                        // A .db that is not a Vaultling vault is still listed, but
                         // greyed: hiding it would leave the user staring at a
                         // folder they know contains the file.
                         let resp = nav_row(
@@ -3492,7 +3494,7 @@ impl App {
                     );
                     if ui.button("Load").clicked() {
                         let path = self.text_path.trim().to_string();
-                        match keypal::import::read_text_file(std::path::Path::new(&path)) {
+                        match vaultling::import::read_text_file(std::path::Path::new(&path)) {
                             Ok(text) => {
                                 // Appended, never overwritten: silently
                                 // replacing whatever the user had already typed
@@ -3790,7 +3792,7 @@ impl App {
         };
         let result = (|| -> Result<(String, usize), String> {
             let text = std::fs::read_to_string(&path).map_err(|_| "cannot read that file")?;
-            let (source, rows) = keypal::import::parse(&text).map_err(|e| e.to_string())?;
+            let (source, rows) = vaultling::import::parse(&text).map_err(|e| e.to_string())?;
             for r in &rows {
                 db.insert_entry_full(
                     session, &r.name, &r.username, &r.password,
@@ -3845,7 +3847,7 @@ impl App {
                 .color(pal().danger),
             );
             ui.add_space(6.0);
-            field(ui, &mut self.export_path, "/home/you/keypal-export.csv", false);
+            field(ui, &mut self.export_path, "/home/you/vaultling-export.csv", false);
             ui.add_space(8.0);
             if ui
                 .add_sized(
@@ -3870,7 +3872,7 @@ impl App {
     fn do_backup(&mut self) {
         let Some(path) = self.vault_path.clone() else { return };
         let Some(db) = self.db.as_ref() else { return };
-        match keypal::export::backup(&path, db.conn()) {
+        match vaultling::export::backup(&path, db.conn()) {
             Ok(target) => {
                 db.log_access(None, "backup");
                 self.set(format!("Backup written to {}", target.display()), Level::Ok);
@@ -3884,10 +3886,10 @@ impl App {
         if target.is_empty() {
             return self.set("Choose where to write the CSV", Level::Bad);
         }
-        let rows: Vec<keypal::export::Outgoing> = self
+        let rows: Vec<vaultling::export::Outgoing> = self
             .rows
             .iter()
-            .map(|r| keypal::export::Outgoing {
+            .map(|r| vaultling::export::Outgoing {
                 name: r.name.clone(),
                 username: r.username.clone(),
                 password: r.password.clone(),
@@ -3898,8 +3900,8 @@ impl App {
             })
             .collect();
         let n = rows.len();
-        let csv = keypal::export::to_csv(&rows);
-        match keypal::export::write_csv(std::path::Path::new(&target), &csv) {
+        let csv = vaultling::export::to_csv(&rows);
+        match vaultling::export::write_csv(std::path::Path::new(&target), &csv) {
             Ok(()) => {
                 if let Some(db) = self.db.as_ref() {
                     db.log_access(None, "export_csv");
@@ -3994,11 +3996,11 @@ impl App {
                 }
             });
             ui.add_space(6.0);
-            // KEYPAL_SHOT_SCROLL=<pixels> starts this page part-way down, so
+            // VAULTLING_SHOT_SCROLL=<pixels> starts this page part-way down, so
             // the sections below the fold can be photographed. Ignored unless
             // a screenshot is being taken.
             let mut area = egui::ScrollArea::vertical();
-            if let Some(y) = std::env::var("KEYPAL_SHOT_SCROLL")
+            if let Some(y) = std::env::var("VAULTLING_SHOT_SCROLL")
                 .ok()
                 .and_then(|v| v.trim().parse::<f32>().ok())
             {
@@ -4031,7 +4033,7 @@ impl App {
                         ui.label(egui::RichText::new("How this protects you").size(21.0).strong());
                         ui.label(
                             egui::RichText::new(format!(
-                                "Keypal {}  ·  by Rafael Kyra",
+                                "Vaultling {}  ·  by Rafael Kyra",
                                 env!("CARGO_PKG_VERSION")
                             ))
                             .size(11.5)
@@ -4167,7 +4169,7 @@ impl App {
                           decrypted entry is written to /tmp.");
 
                 h(ui, "Carrying it on a USB stick");
-                para(ui, "Put an empty file named .keypal-portable beside the program and \
+                para(ui, "Put an empty file named .vaultling-portable beside the program and \
                           it reads and writes only on that medium, touching nothing on \
                           the host. Your vault travels with you and the borrowed machine \
                           keeps no trace — though it can still keep the clipboard, and \
@@ -4381,11 +4383,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 820.0])
             .with_min_inner_size([620.0, 620.0])
-            .with_title("Keypal"),
+            .with_title("Vaultling"),
         ..Default::default()
     };
     eframe::run_native(
-        "Keypal",
+        "Vaultling",
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);

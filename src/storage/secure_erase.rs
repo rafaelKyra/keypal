@@ -40,7 +40,7 @@ pub struct EraseReport {
 /// - Must be called while the vault is **unlocked** (we need the master key to derive wipe_key).
 /// - After this returns, the database contains zero user data and the wipe key is destroyed.
 /// - The caller should then `close()` the [`KeySession`] to destroy the master key too.
-pub fn secure_erase(conn: &Connection, session: &KeySession) -> Result<EraseReport, crate::KeypalError> {
+pub fn secure_erase(conn: &Connection, session: &KeySession) -> Result<EraseReport, crate::VaultlingError> {
     let cipher = Cipher::Aes256Gcm; // must match what was used for encryption
 
     // ── Step 1: derive the one-shot wipe key ────────────────────────────────────
@@ -71,7 +71,7 @@ pub fn secure_erase(conn: &Connection, session: &KeySession) -> Result<EraseRepo
 
         // The nonce column holds 5 concatenated 12-byte nonces (one per field).
         if nonce_b.len() != 60 {
-            return Err(crate::KeypalError::Crypto(format!("bad nonce blob: expected 60 bytes, got {}", nonce_b.len())));
+            return Err(crate::VaultlingError::Crypto(format!("bad nonce blob: expected 60 bytes, got {}", nonce_b.len())));
         }
         let name_nonce: [u8; 12] = nonce_b[0..12].try_into().unwrap();
         let user_nonce: [u8; 12] = nonce_b[12..24].try_into().unwrap();
@@ -133,7 +133,7 @@ pub fn secure_erase(conn: &Connection, session: &KeySession) -> Result<EraseRepo
 }
 
 /// Convenience: run secure erase and then close the key session (destroys master key).
-pub fn destroy_vault(db: &super::VaultDatabase, session: KeySession) -> Result<EraseReport, crate::KeypalError> {
+pub fn destroy_vault(db: &super::VaultDatabase, session: KeySession) -> Result<EraseReport, crate::VaultlingError> {
     let report = secure_erase(db.conn(), &session)?;
     session.close(); // zeroizes enc/mac/wipe subkeys + raw master key
     Ok(report)

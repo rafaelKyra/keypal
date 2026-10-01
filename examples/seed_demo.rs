@@ -12,14 +12,14 @@
 //!
 //! Then photograph it:
 //!
-//!     KEYPAL_SHOT=/tmp/x.png KEYPAL_SHOT_VAULT=/tmp/demo-vault.db \
-//!     KEYPAL_SHOT_PASS=demo-passphrase KEYPAL_SHOT_PANEL=detail \
-//!     KEYPAL_SHOT_KIND=13 ./target/release/keypal-gui
+//!     VAULTLING_SHOT=/tmp/x.png VAULTLING_SHOT_VAULT=/tmp/demo-vault.db \
+//!     VAULTLING_SHOT_PASS=demo-passphrase VAULTLING_SHOT_PANEL=detail \
+//!     VAULTLING_SHOT_KIND=13 ./target/release/vaultling-gui
 
 use rand_core::{OsRng, RngCore};
-use keypal::key_lifecycle::{KeySession, MasterKey};
-use keypal::kind::{encode_fields, Kind};
-use keypal::storage::{EntryDraft, VaultDatabase};
+use vaultling::key_lifecycle::{KeySession, MasterKey};
+use vaultling::kind::{encode_fields, Kind};
+use vaultling::storage::{EntryDraft, VaultDatabase};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap();

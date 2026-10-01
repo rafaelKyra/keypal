@@ -2270,32 +2270,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keypal"
-version = "1.0.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "base32",
- "chacha20poly1305",
- "criterion",
- "eframe",
- "hkdf",
- "hmac 0.12.1",
- "keepass",
- "libc",
- "png 0.17.16",
- "rand_core",
- "rusqlite",
- "sha1",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
- "zbus 5.19.0",
- "zeroize",
-]
-
-[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4084,6 +4058,32 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vaultling"
+version = "1.0.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "base32",
+ "chacha20poly1305",
+ "criterion",
+ "eframe",
+ "hkdf",
+ "hmac 0.12.1",
+ "keepass",
+ "libc",
+ "png 0.17.16",
+ "rand_core",
+ "rusqlite",
+ "sha1",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+ "zbus 5.19.0",
+ "zeroize",
+]
 
 [[package]]
 name = "vcpkg"

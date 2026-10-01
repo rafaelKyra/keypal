@@ -26,7 +26,7 @@ use zeroize::Zeroize;
 /// allocated. Returns `Ok(())` if the lock was applied (or already held), and an
 /// error describing why it could not be — callers should surface this to the user,
 /// because without it secrets *can* reach swap.
-/// Largest single secret allocation Keypal makes: the Argon2id memory buffer
+/// Largest single secret allocation Vaultling makes: the Argon2id memory buffer
 /// (`ArgonPolicy::sota()` = 64 MiB). `mlockall(MCL_FUTURE)` forces *every* future
 /// allocation to be lockable in RAM, so the effective `RLIMIT_MEMLOCK` must cover
 /// this buffer **plus** headroom for the rest of the process (SQLite cache, heap).
@@ -87,7 +87,7 @@ pub fn harden_process_memory() -> Result<(), String> {
 }
 
 /// Zeroize a byte slice with **volatile stores** so the optimizer cannot remove or
-/// reorder the wipe. This is the single primitive every secret type in Keypal uses.
+/// reorder the wipe. This is the single primitive every secret type in Vaultling uses.
 pub fn zeroize_bytes(buf: &mut [u8]) {
     // `zeroize`'s `Zeroize for [u8]` already performs a volatile memset internally;
     // we route through it so behavior stays auditable and consistent.

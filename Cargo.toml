@@ -1,16 +1,16 @@
 [package]
-name = "keypal"
+name = "vaultling"
 version = "1.0.0"
 edition = "2021"
-description = "Keypal — offline vault for passwords, keys, cards and notes"
+description = "Vaultling — offline vault for passwords, keys, cards and notes"
 license = "Apache-2.0"
 authors = ["Rafael Kyra"]
-repository = "https://github.com/rafaelKyra/keypal"
+repository = "https://github.com/rafaelKyra/vaultling"
 
 # ---------------------------------------------------------------------------
-# Keypal — workspace layout
+# Vaultling — workspace layout
 #
-#   keypal/
+#   vaultling/
 #     Cargo.toml                 <- this file
 #     ARCHITECTURE.md            <- threat model + key-lifecycle docs (Phase 1)
 #     src/
@@ -56,12 +56,12 @@ base32 = "0.5"
 png = "0.17"
 
 [[bin]]
-name = "keypal"
+name = "vaultling"
 path = "src/main.rs"
 
 [[bin]]
-name = "keypal-gui"
-path = "src/bin/keypal-gui.rs"
+name = "vaultling-gui"
+path = "src/bin/vaultling-gui.rs"
 
 [dev-dependencies]
 criterion = "0.5"

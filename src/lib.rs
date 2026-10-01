@@ -1,4 +1,4 @@
-//! # Keypal — SOTA Privacy-First Password Vault (Linux)
+//! # Vaultling — SOTA Privacy-First Password Vault (Linux)
 //!
 //! Crate root. Module map:
 //!
@@ -24,7 +24,7 @@ pub mod storage;
 
 /// Crate-wide error type.
 #[derive(Debug, thiserror::Error)]
-pub enum KeypalError {
+pub enum VaultlingError {
     #[error("secure memory: {0}")]
     SecureMem(String),
     #[error("key lifecycle: {0}")]
@@ -37,4 +37,4 @@ pub enum KeypalError {
     Crypto(String),
 }
 
-pub type Result<T> = std::result::Result<T, KeypalError>;
+pub type Result<T> = std::result::Result<T, VaultlingError>;

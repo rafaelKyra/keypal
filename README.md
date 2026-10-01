@@ -1,4 +1,4 @@
-# Keypal
+# Vaultling
 
 An offline vault for passwords, keys, cards and notes. Written in Rust, for Linux.
 Everything stays on your machine: there is no account, no sync and no network
@@ -23,8 +23,8 @@ anything you cannot afford to lose.
   and is written with owner-only permissions.
 - **Trash with restore, and entry history.** Deleted entries can be restored or
   purged; purging overwrites every secret column with random data (encrypted under a wipe key) instead of a plain `DELETE`.
-- **Interfaces.** A desktop application (`keypal-gui`, egui), a command-line tool
-  (`keypal`) and an optional D-Bus service (`keypal serve`).
+- **Interfaces.** A desktop application (`vaultling-gui`, egui), a command-line tool
+  (`vaultling`) and an optional D-Bus service (`vaultling serve`).
 
 ## How it protects secrets
 
@@ -51,14 +51,14 @@ which.
 - Not audited by anyone but its author.
 
 **Memory locking under default limits.** Argon2id asks for a 64 MiB working buffer,
-which cannot be locked when `RLIMIT_MEMLOCK` is at the common default of 8 MiB. Keypal
+which cannot be locked when `RLIMIT_MEMLOCK` is at the common default of 8 MiB. Vaultling
 then warns and continues: key material is still locked per buffer, and the remaining
 exposure is Argon2's temporary working memory during key derivation. Raise the limit
 (`ulimit -l`) or grant `CAP_IPC_LOCK` to close that gap.
 
 ## Intended use and limits
 
-- **Use it for your own data.** Keypal is a password and secrets vault. It is not designed to
+- **Use it for your own data.** Vaultling is a password and secrets vault. It is not designed to
   obstruct a lawful investigation or to destroy data you are legally obliged to keep. You are
   responsible for complying with the law where you live, including any rules on encryption
   software.
@@ -68,12 +68,13 @@ exposure is Argon2's temporary working memory during key derivation. Raise the l
   as a guarantee that data cannot be recovered.
 - **No warranty.** The Apache License disclaims warranty and liability. The code is not
   independently audited. Keep your own backups of the vault file.
-- **Name.** Other products use the name "Keypal". This project is unrelated to them.
+- **Name.** Vaultling was called VALU and, briefly, Keypal. Other products use similar
+  names; this project is unrelated to them.
 
 ## Build and test
 
 ```bash
-cargo build --release        # produces target/release/keypal and keypal-gui
+cargo build --release        # produces target/release/vaultling and vaultling-gui
 cargo test                   # 119 unit tests
 ```
 
@@ -83,34 +84,35 @@ CLI usage, for scripting and testing (passphrases on the command line are visibl
 other local users; use the GUI for real data):
 
 ```bash
-keypal create <vault> <passphrase>
-keypal add    <vault> <passphrase> <name> <username> <password>
-keypal get    <vault> <passphrase> <name>
+vaultling create <vault> <passphrase>
+vaultling add    <vault> <passphrase> <name> <username> <password>
+vaultling get    <vault> <passphrase> <name>
 ```
 
 ## Compatibility note for maintainers
 
-The project was called VALU until 1.0.0. A few identifiers keep the old name **on
+The project was called VALU until 1.0.0, then Keypal, and is now Vaultling. A few identifiers keep the old name **on
 purpose**: the HKDF domain-separation labels (`valu/enc/v1`, `valu/mac/v1`,
 `valu/wipe/v1`, `valu/keyfile/v1`, `valu/breaker/v1`), the D-Bus name `org.rafa.Valu1`
 and the `.local/share/valu` path. The labels are inputs to key derivation: changing
-one makes every existing vault unreadable. Do not rename them as a cleanup.
+one makes every existing vault unreadable. Do not rename them as a cleanup. The portable-mode marker `.keypal-portable` of earlier installs is
+still honoured alongside `.vaultling-portable`.
 
 ## Developing the interface without a screenshot tool
 
 Wayland refuses X11 screen capture, so the GUI can photograph itself. Setting
-`KEYPAL_SHOT=/path/out.png` writes a PNG of the window and exits; F12 captures on demand.
-Further `KEYPAL_SHOT_*` variables (vault, panel, theme, search, scroll) drive it to a
+`VAULTLING_SHOT=/path/out.png` writes a PNG of the window and exits; F12 captures on demand.
+Further `VAULTLING_SHOT_*` variables (vault, panel, theme, search, scroll) drive it to a
 given screen. See `examples/seed_demo.rs` for a demo vault filled with fake data.
 
 This is a development affordance. It is off unless the variable is set, but it exists
-in release builds, and with `KEYPAL_SHOT_VAULT` and `KEYPAL_SHOT_PASS` it will open a
+in release builds, and with `VAULTLING_SHOT_VAULT` and `VAULTLING_SHOT_PASS` it will open a
 vault and write an image of its unlocked contents. Never set these outside development.
 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The Apache license
-covers the code. The name "Keypal" and the mascot image are not licensed for reuse; see
+covers the code. The name "Vaultling" and the mascot image are not licensed for reuse; see
 `NOTICE`. The bundled monospace font keeps its own license in `assets/LICENSE-DejaVu.txt`.
 
 Copyright 2026 Rafael Kyra.

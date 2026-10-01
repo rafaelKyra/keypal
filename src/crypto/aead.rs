@@ -30,17 +30,17 @@ impl Cipher {
 
 /// Encrypt `plaintext` under `key` with the given `nonce`. Returns `ciphertext || tag`.
 /// The plaintext buffer is zeroized after use.
-pub fn encrypt(cipher: Cipher, key: &[u8; 32], nonce: &[u8; 12], mut plaintext: Vec<u8>) -> Result<Vec<u8>, crate::KeypalError> {
+pub fn encrypt(cipher: Cipher, key: &[u8; 32], nonce: &[u8; 12], mut plaintext: Vec<u8>) -> Result<Vec<u8>, crate::VaultlingError> {
     let ct = match cipher {
         Cipher::Aes256Gcm => {
             let enc = Aes256Gcm::new(key.into());
             enc.encrypt(nonce.into(), &plaintext[..])
-                .map_err(|e| crate::KeypalError::Crypto(format!("AES-GCM encrypt: {e}")))?
+                .map_err(|e| crate::VaultlingError::Crypto(format!("AES-GCM encrypt: {e}")))?
         }
         Cipher::ChaCha20Poly1305 => {
             let enc = ChaCha20Poly1305::new(key.into());
             enc.encrypt(nonce.into(), &plaintext[..])
-                .map_err(|e| crate::KeypalError::Crypto(format!("ChaCha20-Poly1305 encrypt: {e}")))?
+                .map_err(|e| crate::VaultlingError::Crypto(format!("ChaCha20-Poly1305 encrypt: {e}")))?
         }
     };
     plaintext.zeroize(); // wipe the in-memory copy immediately
@@ -48,17 +48,17 @@ pub fn encrypt(cipher: Cipher, key: &[u8; 32], nonce: &[u8; 12], mut plaintext: 
 }
 
 /// Decrypt `ciphertext || tag` under `key` with `nonce`. Returns fresh plaintext.
-pub fn decrypt(cipher: Cipher, key: &[u8; 32], nonce: &[u8; 12], ct_tag: &[u8]) -> Result<Vec<u8>, crate::KeypalError> {
+pub fn decrypt(cipher: Cipher, key: &[u8; 32], nonce: &[u8; 12], ct_tag: &[u8]) -> Result<Vec<u8>, crate::VaultlingError> {
     match cipher {
         Cipher::Aes256Gcm => {
             let dec = Aes256Gcm::new(key.into());
             dec.decrypt(nonce.into(), ct_tag)
-                .map_err(|e| crate::KeypalError::Crypto(format!("AES-GCM decrypt (tag mismatch?): {e}")))
+                .map_err(|e| crate::VaultlingError::Crypto(format!("AES-GCM decrypt (tag mismatch?): {e}")))
         }
         Cipher::ChaCha20Poly1305 => {
             let dec = ChaCha20Poly1305::new(key.into());
             dec.decrypt(nonce.into(), ct_tag)
-                .map_err(|e| crate::KeypalError::Crypto(format!("ChaCha20-Poly1305 decrypt (tag mismatch?): {e}")))
+                .map_err(|e| crate::VaultlingError::Crypto(format!("ChaCha20-Poly1305 decrypt (tag mismatch?): {e}")))
         }
     }
 }

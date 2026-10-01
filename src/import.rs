@@ -384,7 +384,7 @@ mod text_tests {
     use super::*;
 
     fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("keypal-text-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vaultling-text-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, bytes).unwrap();
@@ -425,7 +425,7 @@ mod text_tests {
     #[test]
     fn a_missing_file_is_reported_as_unreadable() {
         assert_eq!(
-            read_text_file(std::path::Path::new("/nonexistent/keypal/x.txt")),
+            read_text_file(std::path::Path::new("/nonexistent/vaultling/x.txt")),
             Err(TextError::Unreadable)
         );
     }
